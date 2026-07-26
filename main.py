@@ -1,7 +1,7 @@
 import glob, tqdm, wandb, os, json, random, time, jax
 from absl import app, flags
 from ml_collections import config_flags
-from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
+from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, get_wandb_video
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
@@ -213,7 +213,7 @@ def main(_):
         if FLAGS.restore_file is None:
             raise ValueError("--eval_only requires --restore_file")
 
-        eval_info, _, _ = evaluate(
+        eval_info, _, renders = evaluate(
             agent=agent,
             env=eval_env,
             action_dim=example_batch["actions"].shape[-1],
@@ -222,6 +222,17 @@ def main(_):
             video_frame_skip=FLAGS.video_frame_skip,
         )
         logger.log(eval_info, "eval", step=log_step)
+
+        if renders:
+            run.log(
+                {
+                    "eval/video": get_wandb_video(
+                        renders,
+                        n_cols=min(len(renders), 5),
+                    )
+                },
+                step=log_step,
+            )
 
         for csv_logger in logger.csv_loggers.values():
             csv_logger.close()
@@ -261,7 +272,7 @@ def main(_):
         if i == FLAGS.offline_steps - 1 or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
             # during eval, the action chunk is executed fully
-            eval_info, _, _ = evaluate(
+            eval_info, _, renders = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=example_batch["actions"].shape[-1],
@@ -270,6 +281,17 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
             )
             logger.log(eval_info, "eval", step=log_step)
+
+            if renders:
+                run.log(
+                    {
+                        "eval/video": get_wandb_video(
+                            renders,
+                            n_cols=min(len(renders), 5),
+                        )
+                    },
+                    step=log_step,
+                )
 
     # transition from offline to online
     replay_buffer = ReplayBuffer.create_from_initial_dataset(
@@ -365,7 +387,7 @@ def main(_):
 
         if i == FLAGS.online_steps - 1 or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
-            eval_info, _, _ = evaluate(
+            eval_info, _, renders = evaluate(
                 agent=agent,
                 env=eval_env,
                 action_dim=action_dim,
@@ -374,6 +396,17 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
             )
             logger.log(eval_info, "eval", step=log_step)
+
+            if renders:
+                run.log(
+                    {
+                        "eval/video": get_wandb_video(
+                            renders,
+                            n_cols=min(len(renders), 5),
+                        )
+                    },
+                    step=log_step,
+                )
 
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
