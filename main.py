@@ -21,7 +21,7 @@ def is_robomimic_env(env_name):
     )
 
 
-from utils.flax_utils import save_agent
+from utils.flax_utils import save_agent, restore_agent_with_file
 from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate
@@ -38,8 +38,10 @@ flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
+flags.DEFINE_string('restore_file', None, 'Checkpoint file to restore before training.')
+flags.DEFINE_integer('restore_step', 0, 'Global step represented by the restored checkpoint.')
 
-flags.DEFINE_integer('offline_steps', 1000000, 'Number of online steps.')
+flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -138,7 +140,7 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
-    log_step = 0
+    log_step = FLAGS.restore_step
     
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
@@ -184,6 +186,14 @@ def main(_):
         example_batch['actions'],
         config,
     )
+
+    if FLAGS.restore_file is not None:
+        agent = restore_agent_with_file(agent, FLAGS.restore_file)
+        print(
+            f"Restored checkpoint from {FLAGS.restore_file} "
+            f"at global step {FLAGS.restore_step}",
+            flush=True,
+        )
 
     # Setup logging.
     prefixes = ["eval", "env"]
