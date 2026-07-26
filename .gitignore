@@ -8,3 +8,10 @@ dist/
 .idea/
 .ruff_cache/
 exp/
+
+# Local backup files
+*.bak
+*.before_dataset_fix
+
+# Weights & Biases local runs
+wandb/
