@@ -40,6 +40,7 @@ flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environ
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_file', None, 'Checkpoint file to restore before training.')
 flags.DEFINE_integer('restore_step', 0, 'Global step represented by the restored checkpoint.')
+flags.DEFINE_bool('eval_only', False, 'Only evaluate the restored checkpoint and exit.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
@@ -203,10 +204,30 @@ def main(_):
         prefixes.append("online_agent")
 
     logger = LoggingHelper(
-        csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
+        csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv"))
                     for prefix in prefixes},
         wandb_logger=wandb,
     )
+
+    if FLAGS.eval_only:
+        if FLAGS.restore_file is None:
+            raise ValueError("--eval_only requires --restore_file")
+
+        eval_info, _, _ = evaluate(
+            agent=agent,
+            env=eval_env,
+            action_dim=example_batch["actions"].shape[-1],
+            num_eval_episodes=FLAGS.eval_episodes,
+            num_video_episodes=FLAGS.video_episodes,
+            video_frame_skip=FLAGS.video_frame_skip,
+        )
+        logger.log(eval_info, "eval", step=log_step)
+
+        for csv_logger in logger.csv_loggers.values():
+            csv_logger.close()
+
+        wandb.finish()
+        return
 
     offline_init_time = time.time()
     # Offline RL
