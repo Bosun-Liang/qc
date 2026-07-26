@@ -5,7 +5,21 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
-from envs.robomimic_utils import is_robomimic_env
+def is_robomimic_env(env_name):
+    """Return whether env_name refers to a supported RoboMimic task."""
+    if "low_dim" not in env_name:
+        return False
+
+    parts = env_name.split("-")
+    if len(parts) != 3:
+        return False
+
+    task, dataset_type, _ = parts
+    return (
+        task in ("lift", "can", "square", "transport", "tool_hang")
+        and dataset_type in ("mh", "ph")
+    )
+
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -80,12 +94,37 @@ def main(_):
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
         # custom ogbench dataset
-        assert FLAGS.dataset_replace_interval != 0
         assert FLAGS.dataset_proportion == 1.0
         dataset_idx = 0
+
+        # Convert an evaluation environment name such as
+        # cube-double-play-singletask-task2-v0
+        # to its corresponding dataset stem:
+        # cube-double-play-v0
+        env_parts = FLAGS.env_name.split('-singletask-')
+        if len(env_parts) == 2:
+            version = env_parts[1].rsplit('-', 1)[-1]
+            dataset_stem = f"{env_parts[0]}-{version}"
+        else:
+            dataset_stem = FLAGS.env_name
+
         dataset_paths = [
-            file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file
+            file
+            for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz"))
+            if '-val.npz' not in file
+            and os.path.basename(file).startswith(dataset_stem)
         ]
+
+        if not dataset_paths:
+            raise FileNotFoundError(
+                f"No dataset matching '{dataset_stem}' was found in "
+                f"{FLAGS.ogbench_dataset_dir}"
+            )
+
+        print(
+            f"Matched dataset files for {FLAGS.env_name}: {dataset_paths}",
+            flush=True,
+        )
         env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(
             FLAGS.env_name,
             dataset_path=dataset_paths[dataset_idx],
