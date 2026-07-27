@@ -26,6 +26,7 @@ from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate
 from agents import agents
+from agents.world_model import WorldModelTrainState
 import numpy as np
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -188,8 +189,30 @@ def main(_):
         config,
     )
 
+    world_model = None
+    if config.get('wm_enabled', False):
+        world_model = WorldModelTrainState.create(
+            seed=FLAGS.seed + 1,
+            example_observations=example_batch['observations'],
+            example_actions=example_batch['actions'],
+            horizon_length=FLAGS.horizon_length,
+            latent_dim=config['wm_latent_dim'],
+            hidden_dims=config['wm_hidden_dims'],
+            learning_rate=config['wm_lr'],
+            coef=config['wm_coef'],
+        )
+        print('Initialized independent auxiliary world model.', flush=True)
+
     if FLAGS.restore_file is not None:
-        agent = restore_agent_with_file(agent, FLAGS.restore_file)
+        restored = restore_agent_with_file(
+            agent,
+            FLAGS.restore_file,
+            world_model=world_model,
+        )
+        if world_model is None:
+            agent = restored
+        else:
+            agent, world_model = restored
         print(
             f"Restored checkpoint from {FLAGS.restore_file} "
             f"at global step {FLAGS.restore_step}",
@@ -260,13 +283,27 @@ def main(_):
         batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
 
         agent, offline_info = agent.update(batch)
+        if world_model is not None:
+            world_model, world_model_info = world_model.update(batch)
+            offline_info = {
+                **offline_info,
+                **{
+                    f'world_model/{key}': value
+                    for key, value in world_model_info.items()
+                },
+            }
 
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, log_step)
+            save_agent(
+                agent,
+                FLAGS.save_dir,
+                log_step,
+                world_model=world_model,
+            )
 
         # eval
         if i == FLAGS.offline_steps - 1 or \
@@ -378,7 +415,17 @@ def main(_):
             batch = jax.tree.map(lambda x: x.reshape((
                 FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
 
-            agent, update_info["online_agent"] = agent.batch_update(batch)
+            agent, agent_info = agent.batch_update(batch)
+            if world_model is not None:
+                world_model, world_model_info = world_model.batch_update(batch)
+                agent_info = {
+                    **agent_info,
+                    **{
+                        f'world_model/{key}': value
+                        for key, value in world_model_info.items()
+                    },
+                }
+            update_info["online_agent"] = agent_info
             
         if i % FLAGS.log_interval == 0:
             for key, info in update_info.items():
@@ -410,7 +457,12 @@ def main(_):
 
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, log_step)
+            save_agent(
+                agent,
+                FLAGS.save_dir,
+                log_step,
+                world_model=world_model,
+            )
 
     end_time = time.time()
 

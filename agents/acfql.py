@@ -340,6 +340,11 @@ def get_config():
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
+            wm_enabled=False,
+            wm_coef=0.1,
+            wm_latent_dim=64,
+            wm_hidden_dims=(256, 256),
+            wm_lr=3e-4,
         )
     )
     return config
