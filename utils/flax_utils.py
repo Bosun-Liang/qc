@@ -159,7 +159,13 @@ class TrainState(flax.struct.PyTreeNode):
         return self.apply_gradients(grads=grads), info
 
 
-def save_agent(agent, save_dir, epoch, world_model=None):
+def save_agent(
+    agent,
+    save_dir,
+    epoch,
+    world_model=None,
+    world_model_value=None,
+):
     """Save the agent to a file.
 
     Args:
@@ -173,6 +179,10 @@ def save_agent(agent, save_dir, epoch, world_model=None):
     )
     if world_model is not None:
         save_dict['world_model'] = flax.serialization.to_state_dict(world_model)
+    if world_model_value is not None:
+        save_dict['world_model_value'] = flax.serialization.to_state_dict(
+            world_model_value
+        )
     save_path = os.path.join(save_dir, f'params_{epoch}.pkl')
     with open(save_path, 'wb') as f:
         pickle.dump(save_dict, f)
@@ -180,7 +190,12 @@ def save_agent(agent, save_dir, epoch, world_model=None):
     print(f'Saved to {save_path}')
 
 
-def restore_agent_with_file(agent, file_path, world_model=None):
+def restore_agent_with_file(
+    agent,
+    file_path,
+    world_model=None,
+    world_model_value=None,
+):
     """Just like restore_agent() but expect file_path to include restore_epoch
     """
     assert os.path.exists(file_path), f'File {file_path} does not exist'
@@ -191,6 +206,7 @@ def restore_agent_with_file(agent, file_path, world_model=None):
 
     print(f'Restored from {file_path}')
 
+    restored_states = [agent]
     if world_model is not None:
         if 'world_model' in load_dict:
             world_model = flax.serialization.from_state_dict(
@@ -203,7 +219,24 @@ def restore_agent_with_file(agent, file_path, world_model=None):
                 'Checkpoint has no world_model state; using newly initialized '
                 'world model parameters.'
             )
-        return agent, world_model
+        restored_states.append(world_model)
+
+    if world_model_value is not None:
+        if 'world_model_value' in load_dict:
+            world_model_value = flax.serialization.from_state_dict(
+                world_model_value,
+                load_dict['world_model_value'],
+            )
+            print(f'Restored world model value head from {file_path}')
+        else:
+            print(
+                'Checkpoint has no world_model_value state; using newly '
+                'initialized diagnostic value-head parameters.'
+            )
+        restored_states.append(world_model_value)
+
+    if len(restored_states) > 1:
+        return tuple(restored_states)
 
     return agent
 

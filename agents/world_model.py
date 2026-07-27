@@ -46,6 +46,19 @@ class LatentDynamics(nn.Module):
         )(inputs)
 
 
+class LatentValueHead(nn.Module):
+    """Predict a scalar future critic value from a predicted latent."""
+
+    hidden_dims: Sequence[int]
+
+    @nn.compact
+    def __call__(self, latents):
+        return MLP(
+            (*self.hidden_dims, 1),
+            activate_final=False,
+        )(latents).squeeze(-1)
+
+
 class WorldModel(nn.Module):
     """Encode observations and predict the latent after an action chunk."""
 
@@ -195,3 +208,187 @@ class WorldModelTrainState(flax.struct.PyTreeNode):
         state, infos = jax.lax.scan(self._update, self, batch)
         infos = jax.tree_util.tree_map(lambda value: value.mean(), infos)
         return state, infos
+
+
+class LatentValueTrainState(flax.struct.PyTreeNode):
+    """Independent diagnostic head for future-value prediction.
+
+    The head consumes a stopped-gradient world-model prediction. Its target is
+    the stopped target-critic value at the real observation after the chunk.
+    It never participates in policy action selection.
+    """
+
+    rng: Any
+    network: Any
+    coef: float = nonpytree_field()
+
+    @classmethod
+    def create(
+        cls,
+        seed,
+        latent_dim=64,
+        hidden_dims=(256, 256),
+        learning_rate=3e-4,
+        coef=1.0,
+    ):
+        rng = jax.random.PRNGKey(seed)
+        rng, init_rng = jax.random.split(rng)
+        model = LatentValueHead(hidden_dims=hidden_dims)
+        params = model.init(
+            init_rng,
+            jnp.zeros((latent_dim,), dtype=jnp.float32),
+        )["params"]
+        network = TrainState.create(
+            model_def=model,
+            params=params,
+            tx=optax.adam(learning_rate=learning_rate),
+        )
+        return cls(rng=rng, network=network, coef=coef)
+
+    def value_loss(self, batch, world_model, agent, rng, params):
+        target_observations = batch["next_observations"][..., -1, :]
+        predicted_latents, _ = world_model.network(
+            batch["observations"],
+            batch["actions"],
+            target_observations,
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+
+        next_actions = agent.sample_actions(target_observations, rng=rng)
+        target_qs = agent.network.select("target_critic")(
+            target_observations,
+            actions=next_actions,
+        )
+        if agent.config["q_agg"] == "min":
+            raw_target_values = target_qs.min(axis=0)
+        else:
+            raw_target_values = target_qs.mean(axis=0)
+        raw_target_values = jax.lax.stop_gradient(raw_target_values)
+
+        predictions = self.network(predicted_latents, params=params)
+        valid = batch["valid"][..., -1].astype(predictions.dtype)
+        valid_count = jnp.maximum(jnp.sum(valid), jnp.asarray(1.0, valid.dtype))
+        raw_target_mean = jnp.sum(raw_target_values * valid) / valid_count
+        raw_target_variance = jnp.sum(
+            jnp.square(raw_target_values - raw_target_mean) * valid
+        ) / valid_count
+        raw_target_std = jnp.sqrt(jnp.maximum(raw_target_variance, 0.0))
+        target_values = (
+            raw_target_values - raw_target_mean
+        ) / raw_target_std.clip(1e-6)
+        errors = predictions - target_values
+        loss = jnp.sum(jnp.square(errors) * valid) / valid_count
+        mae = jnp.sum(jnp.abs(errors) * valid) / valid_count
+
+        prediction_mean = jnp.sum(predictions * valid) / valid_count
+        target_mean = jnp.sum(target_values * valid) / valid_count
+        centered_predictions = predictions - prediction_mean
+        centered_targets = target_values - target_mean
+        covariance = jnp.sum(
+            centered_predictions * centered_targets * valid
+        ) / valid_count
+        prediction_variance = jnp.sum(
+            jnp.square(centered_predictions) * valid
+        ) / valid_count
+        target_variance = jnp.sum(
+            jnp.square(centered_targets) * valid
+        ) / valid_count
+        correlation = covariance / jnp.sqrt(
+            prediction_variance * target_variance
+        ).clip(1e-8)
+
+        pair_valid = valid[:-1] * valid[1:]
+        pair_count = jnp.maximum(
+            jnp.sum(pair_valid),
+            jnp.asarray(1.0, pair_valid.dtype),
+        )
+        pairwise_agreement = jnp.sum(
+            (
+                (predictions[:-1] - predictions[1:])
+                * (target_values[:-1] - target_values[1:])
+                > 0
+            ).astype(predictions.dtype)
+            * pair_valid
+        ) / pair_count
+
+        topk = max(1, predictions.shape[0] // 10)
+        masked_predictions = jnp.where(valid > 0, predictions, -jnp.inf)
+        masked_targets = jnp.where(valid > 0, target_values, -jnp.inf)
+        _, prediction_topk = jax.lax.top_k(masked_predictions, topk)
+        _, target_topk = jax.lax.top_k(masked_targets, topk)
+        topk_agreement = jnp.mean(
+            jnp.isin(prediction_topk, target_topk).astype(predictions.dtype)
+        )
+
+        info = {
+            "loss": loss,
+            "mae": mae,
+            "correlation": correlation,
+            "pairwise_agreement": pairwise_agreement,
+            "topk_agreement": topk_agreement,
+            "prediction_mean": prediction_mean,
+            "prediction_std": jnp.sqrt(jnp.maximum(prediction_variance, 0.0)),
+            "target_mean": target_mean,
+            "target_std": jnp.sqrt(jnp.maximum(target_variance, 0.0)),
+            "raw_target_mean": raw_target_mean,
+            "raw_target_std": raw_target_std,
+            "valid_fraction": valid.mean(),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(predictions)),
+                jnp.logical_and(
+                    jnp.logical_and(
+                        jnp.all(jnp.isfinite(raw_target_values)),
+                        jnp.all(jnp.isfinite(target_values)),
+                    ),
+                    jnp.all(jnp.isfinite(jnp.asarray((loss, correlation)))),
+                ),
+            ),
+        }
+        return loss, info
+
+    @staticmethod
+    def _update(state, batch, world_model, agent):
+        new_rng, sample_rng = jax.random.split(state.rng)
+
+        def loss_fn(params):
+            loss, info = state.value_loss(
+                batch,
+                world_model,
+                agent,
+                sample_rng,
+                params,
+            )
+            weighted_loss = state.coef * loss
+            info["weighted_loss"] = weighted_loss
+            return weighted_loss, info
+
+        network, info = state.network.apply_loss_fn(loss_fn)
+        return state.replace(rng=new_rng, network=network), info
+
+    @jax.jit
+    def update(self, batch, world_model, agent):
+        """Apply one diagnostic value-head update."""
+        return self._update(self, batch, world_model, agent)
+
+    @jax.jit
+    def batch_update(self, batch, world_model, agent):
+        """Apply one value-head update per leading UTD axis entry."""
+
+        def scan_update(state, scan_batch):
+            return self._update(state, scan_batch, world_model, agent)
+
+        state, infos = jax.lax.scan(scan_update, self, batch)
+        infos = jax.tree_util.tree_map(lambda value: value.mean(), infos)
+        return state, infos
+
+    @jax.jit
+    def evaluate(self, batch, world_model, agent):
+        """Evaluate diagnostics with a fixed RNG and without changing state."""
+        _, info = self.value_loss(
+            batch,
+            world_model,
+            agent,
+            jax.random.PRNGKey(0),
+            self.network.params,
+        )
+        return info

@@ -26,7 +26,7 @@ from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate
 from agents import agents
-from agents.world_model import WorldModelTrainState
+from agents.world_model import LatentValueTrainState, WorldModelTrainState
 import numpy as np
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -190,6 +190,7 @@ def main(_):
     )
 
     world_model = None
+    world_model_value = None
     if config.get('wm_enabled', False):
         world_model = WorldModelTrainState.create(
             seed=FLAGS.seed + 1,
@@ -202,17 +203,43 @@ def main(_):
             coef=config['wm_coef'],
         )
         print('Initialized independent auxiliary world model.', flush=True)
+    if config.get('wm_value_enabled', False):
+        if world_model is None:
+            raise ValueError('wm_value_enabled requires wm_enabled=True')
+        world_model_value = LatentValueTrainState.create(
+            seed=FLAGS.seed + 2,
+            latent_dim=config['wm_latent_dim'],
+            hidden_dims=config['wm_value_hidden_dims'],
+            learning_rate=config['wm_value_lr'],
+            coef=config['wm_value_coef'],
+        )
+        print('Initialized diagnostic latent value head.', flush=True)
+
+    value_validation_batch = None
+    if world_model_value is not None:
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 10_000)
+        value_validation_dataset = Dataset.create(**val_dataset)
+        value_validation_batch = value_validation_dataset.sample_sequence(
+            config['batch_size'],
+            sequence_length=FLAGS.horizon_length,
+            discount=discount,
+        )
+        np.random.set_state(numpy_rng_state)
 
     if FLAGS.restore_file is not None:
         restored = restore_agent_with_file(
             agent,
             FLAGS.restore_file,
             world_model=world_model,
+            world_model_value=world_model_value,
         )
         if world_model is None:
             agent = restored
-        else:
+        elif world_model_value is None:
             agent, world_model = restored
+        else:
+            agent, world_model, world_model_value = restored
         print(
             f"Restored checkpoint from {FLAGS.restore_file} "
             f"at global step {FLAGS.restore_step}",
@@ -292,8 +319,34 @@ def main(_):
                     for key, value in world_model_info.items()
                 },
             }
+        if world_model_value is not None:
+            world_model_value, value_info = world_model_value.update(
+                batch,
+                world_model,
+                agent,
+            )
+            offline_info = {
+                **offline_info,
+                **{
+                    f'world_model_value/{key}': value
+                    for key, value in value_info.items()
+                },
+            }
 
         if i % FLAGS.log_interval == 0:
+            if world_model_value is not None:
+                heldout_info = world_model_value.evaluate(
+                    value_validation_batch,
+                    world_model,
+                    agent,
+                )
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model_value/heldout_{key}': value
+                        for key, value in heldout_info.items()
+                    },
+                }
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -303,6 +356,7 @@ def main(_):
                 FLAGS.save_dir,
                 log_step,
                 world_model=world_model,
+                world_model_value=world_model_value,
             )
 
         # eval
@@ -425,9 +479,38 @@ def main(_):
                         for key, value in world_model_info.items()
                     },
                 }
+            if world_model_value is not None:
+                world_model_value, value_info = world_model_value.batch_update(
+                    batch,
+                    world_model,
+                    agent,
+                )
+                agent_info = {
+                    **agent_info,
+                    **{
+                        f'world_model_value/{key}': value
+                        for key, value in value_info.items()
+                    },
+                }
             update_info["online_agent"] = agent_info
             
         if i % FLAGS.log_interval == 0:
+            if (
+                world_model_value is not None
+                and "online_agent" in update_info
+            ):
+                heldout_info = world_model_value.evaluate(
+                    value_validation_batch,
+                    world_model,
+                    agent,
+                )
+                update_info["online_agent"] = {
+                    **update_info["online_agent"],
+                    **{
+                        f'world_model_value/heldout_{key}': value
+                        for key, value in heldout_info.items()
+                    },
+                }
             for key, info in update_info.items():
                 logger.log(info, key, step=log_step)
             update_info = {}
@@ -462,6 +545,7 @@ def main(_):
                 FLAGS.save_dir,
                 log_step,
                 world_model=world_model,
+                world_model_value=world_model_value,
             )
 
     end_time = time.time()

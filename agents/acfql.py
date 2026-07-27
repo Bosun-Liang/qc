@@ -345,6 +345,10 @@ def get_config():
             wm_latent_dim=64,
             wm_hidden_dims=(256, 256),
             wm_lr=3e-4,
+            wm_value_enabled=False,
+            wm_value_coef=1.0,
+            wm_value_hidden_dims=(256, 256),
+            wm_value_lr=3e-4,
         )
     )
     return config
