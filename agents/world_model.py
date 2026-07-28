@@ -86,6 +86,26 @@ class LatentPotentialHead(nn.Module):
         )(latents).squeeze(-1)
 
 
+class LatentPotentialDeltaHead(nn.Module):
+    """Predict potential change from a latent world-model transition."""
+
+    hidden_dims: Sequence[int]
+
+    @nn.compact
+    def __call__(self, latents, predicted_latents, action_chunks):
+        flat_actions = action_chunks.reshape(
+            (*action_chunks.shape[:-2], -1)
+        )
+        inputs = jnp.concatenate(
+            (latents, predicted_latents - latents, flat_actions),
+            axis=-1,
+        )
+        return MLP(
+            (*self.hidden_dims, 1),
+            activate_final=False,
+        )(inputs).squeeze(-1)
+
+
 class WorldModel(nn.Module):
     """Encode observations and predict the latent after an action chunk."""
 
@@ -112,6 +132,12 @@ class WorldModel(nn.Module):
     def encode(self, observations):
         """Encode observations without running chunk dynamics."""
         return self.encoder(observations)
+
+    def predict(self, observations, actions):
+        """Predict an action-chunk future latent without a target encode."""
+        latents = self.encoder(observations)
+        flat_actions = actions.reshape((*actions.shape[:-2], -1))
+        return self.dynamics(latents, flat_actions)
 
 
 def world_model_loss(apply_fn, params, batch):
@@ -1606,3 +1632,410 @@ class LatentPotentialTrainState(flax.struct.PyTreeNode):
                 jnp.all(jnp.isfinite(potential_scores)),
             ),
         }
+
+
+class LatentPotentialDeltaTrainState(flax.struct.PyTreeNode):
+    """Independent regressor for short-horizon potential changes."""
+
+    network: Any
+    coef: float = nonpytree_field()
+    target_mean: float = nonpytree_field()
+    target_std: float = nonpytree_field()
+    nontrivial_threshold: float = nonpytree_field()
+
+    @classmethod
+    def create(
+        cls,
+        seed,
+        latent_dim,
+        example_action_chunk,
+        hidden_dims=(256, 256),
+        learning_rate=3e-4,
+        coef=1.0,
+        target_mean=0.0,
+        target_std=1.0,
+        nontrivial_threshold=0.01,
+    ):
+        if target_std <= 0:
+            raise ValueError("target_std must be positive")
+        if nontrivial_threshold <= 0:
+            raise ValueError("nontrivial_threshold must be positive")
+        model = LatentPotentialDeltaHead(hidden_dims=hidden_dims)
+        zero_latent = jnp.zeros((latent_dim,), dtype=jnp.float32)
+        params = model.init(
+            jax.random.PRNGKey(seed),
+            zero_latent,
+            zero_latent,
+            jnp.zeros_like(example_action_chunk),
+        )["params"]
+        network = TrainState.create(
+            model_def=model,
+            params=params,
+            tx=optax.adam(learning_rate=learning_rate),
+        )
+        return cls(
+            network=network,
+            coef=coef,
+            target_mean=float(target_mean),
+            target_std=float(target_std),
+            nontrivial_threshold=float(nontrivial_threshold),
+        )
+
+    def delta_loss(self, batch, world_model, params):
+        latents = world_model.network(
+            batch["observations"], method="encode"
+        )
+        predicted_latents = world_model.network(
+            batch["observations"],
+            batch["actions"],
+            method="predict",
+        )
+        latents = jax.lax.stop_gradient(latents)
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        normalized_predictions = self.network(
+            latents,
+            predicted_latents,
+            batch["actions"],
+            params=params,
+        )
+        targets = batch["wm_potential_deltas"].astype(
+            normalized_predictions.dtype
+        )
+        target_mean = jnp.asarray(
+            self.target_mean, dtype=normalized_predictions.dtype
+        )
+        target_std = jnp.asarray(
+            self.target_std, dtype=normalized_predictions.dtype
+        )
+        normalized_targets = (targets - target_mean) / target_std
+        predictions = normalized_predictions * target_std + target_mean
+        normalized_errors = normalized_predictions - normalized_targets
+        loss = jnp.mean(jnp.square(normalized_errors))
+        errors = predictions - targets
+        mae = jnp.mean(jnp.abs(errors))
+
+        centered_predictions = predictions - predictions.mean()
+        centered_targets = targets - targets.mean()
+        prediction_variance = jnp.mean(jnp.square(centered_predictions))
+        target_variance = jnp.mean(jnp.square(centered_targets))
+        covariance = jnp.mean(centered_predictions * centered_targets)
+        correlation = covariance / jnp.sqrt(
+            prediction_variance * target_variance
+        ).clip(1e-8)
+        raw_mse = jnp.mean(jnp.square(errors))
+        r2 = 1.0 - raw_mse / target_variance.clip(1e-8)
+        threshold = jnp.asarray(
+            self.nontrivial_threshold, dtype=predictions.dtype
+        )
+        nontrivial = (jnp.abs(targets) > threshold).astype(
+            predictions.dtype
+        )
+        nontrivial_count = jnp.maximum(
+            jnp.sum(nontrivial),
+            jnp.asarray(1.0, dtype=predictions.dtype),
+        )
+        sign_agreement = jnp.sum(
+            (jnp.sign(predictions) == jnp.sign(targets)).astype(
+                predictions.dtype
+            )
+            * nontrivial
+        ) / nontrivial_count
+
+        info = {
+            "loss": loss,
+            "mae": mae,
+            "correlation": correlation,
+            "r2": r2,
+            "prediction_mean": predictions.mean(),
+            "prediction_std": jnp.sqrt(
+                jnp.maximum(prediction_variance, 0.0)
+            ),
+            "target_mean": targets.mean(),
+            "target_std": jnp.sqrt(jnp.maximum(target_variance, 0.0)),
+            "nontrivial_fraction": nontrivial.mean(),
+            "nontrivial_sign_agreement": sign_agreement,
+            "decrease_fraction": jnp.mean((targets < -threshold).astype(
+                predictions.dtype
+            )),
+            "neutral_fraction": jnp.mean(
+                (jnp.abs(targets) <= threshold).astype(predictions.dtype)
+            ),
+            "increase_fraction": jnp.mean((targets > threshold).astype(
+                predictions.dtype
+            )),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(predictions)),
+                jnp.all(
+                    jnp.isfinite(
+                        jnp.asarray((loss, mae, correlation, r2))
+                    )
+                ),
+            ),
+        }
+        return loss, info
+
+    @staticmethod
+    def _update(state, batch, world_model):
+        def loss_fn(params):
+            loss, info = state.delta_loss(batch, world_model, params)
+            weighted_loss = state.coef * loss
+            info["weighted_loss"] = weighted_loss
+            return weighted_loss, info
+
+        network, info = state.network.apply_loss_fn(loss_fn)
+        return state.replace(network=network), info
+
+    @jax.jit
+    def update(self, batch, world_model):
+        return self._update(self, batch, world_model)
+
+    @jax.jit
+    def batch_update(self, batch, world_model):
+        def scan_update(state, scan_batch):
+            return self._update(state, scan_batch, world_model)
+
+        state, infos = jax.lax.scan(scan_update, self, batch)
+        infos = jax.tree_util.tree_map(lambda value: value.mean(), infos)
+        return state, infos
+
+    @jax.jit
+    def evaluate(self, batch, world_model):
+        _, info = self.delta_loss(batch, world_model, self.network.params)
+        return info
+
+    @jax.jit
+    def evaluate_candidates(self, observations, world_model, agent, rng):
+        """Compare critic and predicted-delta rankings read-only."""
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = jnp.clip(
+            agent.compute_flow_actions(candidate_observations, noises),
+            -1,
+            1,
+        )
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        latents = world_model.network(
+            candidate_observations, method="encode"
+        )
+        predicted_latents = world_model.network(
+            candidate_observations,
+            action_chunks,
+            method="predict",
+        )
+        latents = jax.lax.stop_gradient(latents)
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        normalized_delta_scores = self.network(
+            latents, predicted_latents, action_chunks
+        )
+        delta_scores = (
+            normalized_delta_scores * self.target_std + self.target_mean
+        )
+        critic_ranks = jnp.argsort(
+            jnp.argsort(critic_scores, axis=-1), axis=-1
+        ).astype(delta_scores.dtype)
+        delta_ranks = jnp.argsort(
+            jnp.argsort(delta_scores, axis=-1), axis=-1
+        ).astype(delta_scores.dtype)
+
+        def mean_correlation(left, right):
+            left = left - left.mean(axis=-1, keepdims=True)
+            right = right - right.mean(axis=-1, keepdims=True)
+            return jnp.mean(
+                jnp.sum(left * right, axis=-1)
+                / jnp.sqrt(
+                    jnp.sum(jnp.square(left), axis=-1)
+                    * jnp.sum(jnp.square(right), axis=-1)
+                ).clip(1e-8)
+            )
+
+        critic_top1 = jnp.argmax(critic_scores, axis=-1)
+        delta_top1 = jnp.argmax(delta_scores, axis=-1)
+        topk = max(1, num_samples // 10)
+        _, critic_topk = jax.lax.top_k(critic_scores, topk)
+        _, delta_topk = jax.lax.top_k(delta_scores, topk)
+        topk_overlap = jnp.mean(
+            jax.vmap(
+                lambda left, right: jnp.mean(
+                    jnp.any(
+                        left[:, None] == right[None, :], axis=-1
+                    ).astype(delta_scores.dtype)
+                )
+            )(critic_topk, delta_topk)
+        )
+        critic_choice_delta_rank = jnp.take_along_axis(
+            delta_ranks, critic_top1[..., None], axis=-1
+        ).squeeze(-1)
+        delta_choice_critic_rank = jnp.take_along_axis(
+            critic_ranks, delta_top1[..., None], axis=-1
+        ).squeeze(-1)
+        rank_denominator = jnp.asarray(
+            max(1, num_samples - 1), dtype=delta_scores.dtype
+        )
+        critic_actions = jnp.take_along_axis(
+            candidate_actions,
+            critic_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        delta_actions = jnp.take_along_axis(
+            candidate_actions,
+            delta_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        threshold = jnp.asarray(
+            self.nontrivial_threshold, dtype=delta_scores.dtype
+        )
+        return {
+            "spearman_correlation": mean_correlation(
+                critic_ranks, delta_ranks
+            ),
+            "score_correlation": mean_correlation(
+                critic_scores, delta_scores
+            ),
+            "top1_agreement": jnp.mean(
+                (critic_top1 == delta_top1).astype(delta_scores.dtype)
+            ),
+            "topk_overlap": topk_overlap,
+            "random_top1_agreement": jnp.asarray(
+                1.0 / num_samples, dtype=delta_scores.dtype
+            ),
+            "random_topk_overlap": jnp.asarray(
+                topk / num_samples, dtype=delta_scores.dtype
+            ),
+            "critic_choice_delta_percentile": jnp.mean(
+                critic_choice_delta_rank / rank_denominator
+            ),
+            "delta_choice_critic_percentile": jnp.mean(
+                delta_choice_critic_rank / rank_denominator
+            ),
+            "selected_action_l2": jnp.mean(
+                jnp.linalg.norm(critic_actions - delta_actions, axis=-1)
+            ),
+            "critic_score_std": jnp.mean(
+                jnp.std(critic_scores, axis=-1)
+            ),
+            "candidate_action_std": jnp.mean(
+                jnp.std(candidate_actions, axis=-2)
+            ),
+            "delta_score_mean": jnp.mean(delta_scores),
+            "delta_score_std": jnp.mean(
+                jnp.std(delta_scores, axis=-1)
+            ),
+            "delta_score_global_std": jnp.std(delta_scores),
+            "max_delta_mean": jnp.mean(
+                jnp.max(delta_scores, axis=-1)
+            ),
+            "positive_candidate_fraction": jnp.mean(
+                (delta_scores > threshold).astype(delta_scores.dtype)
+            ),
+            "states_with_positive_candidate": jnp.mean(
+                jnp.any(delta_scores > threshold, axis=-1).astype(
+                    delta_scores.dtype
+                )
+            ),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(critic_scores)),
+                jnp.all(jnp.isfinite(delta_scores)),
+            ),
+        }
+
+
+    @jax.jit
+    def sample_actions(
+        self,
+        observations,
+        world_model,
+        agent,
+        rng,
+        score_lambda=0.0,
+    ):
+        """Select best-of-N actions using critic plus predicted delta.
+
+        A zero coefficient follows the original critic-only argmax exactly.
+        This read-only method is separate from `ACFQLAgent.sample_actions`, so
+        baseline training, online collection, and default evaluation remain
+        unchanged.
+        """
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = jnp.clip(
+            agent.compute_flow_actions(candidate_observations, noises),
+            -1,
+            1,
+        )
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        latents = world_model.network(
+            candidate_observations, method="encode"
+        )
+        predicted_latents = world_model.network(
+            candidate_observations,
+            action_chunks,
+            method="predict",
+        )
+        normalized_delta_scores = self.network(
+            latents, predicted_latents, action_chunks
+        )
+        delta_scores = (
+            normalized_delta_scores * self.target_std + self.target_mean
+        )
+        normalized_critic_scores = (
+            critic_scores - critic_scores.mean(axis=-1, keepdims=True)
+        ) / jnp.std(critic_scores, axis=-1, keepdims=True).clip(1e-6)
+        normalized_delta_scores = (
+            delta_scores - delta_scores.mean(axis=-1, keepdims=True)
+        ) / jnp.std(delta_scores, axis=-1, keepdims=True).clip(1e-6)
+        mixed_scores = (
+            normalized_critic_scores
+            + score_lambda * normalized_delta_scores
+        )
+        selection_scores = jax.lax.cond(
+            jnp.asarray(score_lambda) == 0,
+            lambda: critic_scores,
+            lambda: mixed_scores,
+        )
+        indices = jnp.argmax(selection_scores, axis=-1)
+
+        batch_shape = indices.shape
+        flat_indices = indices.reshape(-1)
+        batch_size = len(flat_indices)
+        return candidate_actions.reshape(
+            (-1, num_samples, flat_action_dim)
+        )[jnp.arange(batch_size), flat_indices, :].reshape(
+            batch_shape + (flat_action_dim,)
+        )

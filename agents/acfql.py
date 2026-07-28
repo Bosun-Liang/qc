@@ -362,6 +362,12 @@ def get_config():
             wm_potential_temperature=0.04,
             wm_potential_num_bins=8,
             wm_potential_validation_per_bin=256,
+            wm_delta_enabled=False,
+            wm_delta_coef=1.0,
+            wm_delta_hidden_dims=(256, 256),
+            wm_delta_lr=3e-4,
+            wm_delta_nontrivial_threshold=0.01,
+            wm_delta_validation_per_class=256,
         )
     )
     return config

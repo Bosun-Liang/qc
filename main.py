@@ -28,6 +28,7 @@ from utils.datasets import Dataset, ReplayBuffer
 from evaluation import evaluate, flatten
 from agents import agents
 from agents.world_model import (
+    LatentPotentialDeltaTrainState,
     LatentPotentialTrainState,
     LatentProgressTrainState,
     LatentValueTrainState,
@@ -69,6 +70,11 @@ flags.DEFINE_bool(
     'Freeze agent/world-model states and train only the potential head.',
 )
 flags.DEFINE_bool(
+    'wm_delta_only',
+    False,
+    'Freeze agent/world-model states and train only the potential-delta head.',
+)
+flags.DEFINE_bool(
     'wm_score_eval_enabled',
     False,
     'Use normalized critic plus latent-value scoring in eval-only mode.',
@@ -78,8 +84,18 @@ flags.DEFINE_float(
     0.0,
     'Latent-value coefficient used when wm_score_eval_enabled is true.',
 )
+flags.DEFINE_bool(
+    "wm_delta_score_eval_enabled",
+    False,
+    "Use normalized critic plus latent potential-delta scoring in eval-only mode.",
+)
+flags.DEFINE_float(
+    "wm_delta_score_lambda",
+    0.0,
+    "Potential-delta coefficient used when wm_delta_score_eval_enabled is true.",
+)
 flags.DEFINE_integer(
-    'eval_seed',
+    "eval_seed",
     None,
     'Optional deterministic per-episode seed for eval-only comparisons.',
 )
@@ -139,9 +155,29 @@ def main(_):
         raise ValueError(
             "--wm_score_eval_enabled is restricted to --eval_only=True"
         )
-    if FLAGS.wm_progress_only and FLAGS.wm_potential_only:
+    if FLAGS.wm_delta_score_eval_enabled and not FLAGS.eval_only:
         raise ValueError(
-            "--wm_progress_only and --wm_potential_only are mutually exclusive"
+            "--wm_delta_score_eval_enabled is restricted to --eval_only=True"
+        )
+    if (
+        FLAGS.wm_score_eval_enabled
+        and FLAGS.wm_delta_score_eval_enabled
+    ):
+        raise ValueError(
+            "--wm_score_eval_enabled and --wm_delta_score_eval_enabled are "
+            "mutually exclusive"
+        )
+    diagnostic_only_count = sum(
+        (
+            FLAGS.wm_progress_only,
+            FLAGS.wm_potential_only,
+            FLAGS.wm_delta_only,
+        )
+    )
+    if diagnostic_only_count > 1:
+        raise ValueError(
+            "wm_progress_only, wm_potential_only, and wm_delta_only are "
+            "mutually exclusive"
         )
     if FLAGS.wm_progress_only:
         if FLAGS.restore_file is None:
@@ -161,14 +197,26 @@ def main(_):
             raise ValueError(
                 "--wm_potential_only requires wm_potential_enabled=True"
             )
-    if config.get('wm_potential_enabled', False):
+    if FLAGS.wm_delta_only:
+        if FLAGS.restore_file is None:
+            raise ValueError("--wm_delta_only requires --restore_file")
+        if FLAGS.online_steps != 0:
+            raise ValueError("--wm_delta_only requires --online_steps=0")
+        if not config.get('wm_delta_enabled', False):
+            raise ValueError(
+                "--wm_delta_only requires wm_delta_enabled=True"
+            )
+    cube_aux_enabled = config.get(
+        'wm_potential_enabled', False
+    ) or config.get('wm_delta_enabled', False)
+    if cube_aux_enabled:
         if FLAGS.ogbench_dataset_dir is None or 'cube' not in FLAGS.env_name:
             raise ValueError(
-                "wm_potential_enabled currently supports only OGBench cube tasks"
+                "potential/delta diagnostics currently support only OGBench cube tasks"
             )
         if FLAGS.online_steps != 0:
             raise ValueError(
-                "wm_potential_enabled is currently restricted to online_steps=0"
+                "potential/delta diagnostics are restricted to online_steps=0"
             )
     
     # data loading
@@ -209,7 +257,7 @@ def main(_):
             FLAGS.env_name,
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
-            add_info=config.get('wm_potential_enabled', False),
+            add_info=cube_aux_enabled,
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
@@ -226,7 +274,7 @@ def main(_):
 
     # handle dataset
     potential_target_cube_xyzs = None
-    if config.get('wm_potential_enabled', False):
+    if cube_aux_enabled:
         num_cubes = env.unwrapped._num_cubes
         potential_target_cube_xyzs = (
             env.unwrapped._data.mocap_pos.copy()[:num_cubes]
@@ -294,7 +342,60 @@ def main(_):
             ds = Dataset.create(**ds_dict)
 
         return ds
-    
+
+    def get_delta_start_groups(dataset):
+        """Return terminal-valid starts grouped as decrease/neutral/increase."""
+        horizon_length = FLAGS.horizon_length
+        max_start = dataset.size - horizon_length
+        terminals = np.asarray(dataset['terminals']).reshape(-1)
+        terminal_prefix = np.concatenate(
+            ([0], np.cumsum(terminals > 0))
+        )
+        terminal_counts = (
+            terminal_prefix[
+                horizon_length:horizon_length + max_start
+            ]
+            - terminal_prefix[:max_start]
+        )
+        valid_starts = np.flatnonzero(terminal_counts == 0)
+        potentials = np.asarray(
+            dataset['wm_potentials']
+        ).reshape(-1)
+        deltas = (
+            potentials[valid_starts + horizon_length]
+            - potentials[valid_starts]
+        )
+        threshold = config['wm_delta_nontrivial_threshold']
+        groups = [
+            valid_starts[deltas < -threshold],
+            valid_starts[np.abs(deltas) <= threshold],
+            valid_starts[deltas > threshold],
+        ]
+        if any(len(group) == 0 for group in groups):
+            raise ValueError(
+                'Potential-delta decrease/neutral/increase groups must '
+                'all be present'
+            )
+        return groups, deltas
+
+    def make_delta_batch(dataset, start_indices):
+        horizon_length = FLAGS.horizon_length
+        action_indices = (
+            start_indices[:, None]
+            + np.arange(horizon_length)[None, :]
+        )
+        potentials = np.asarray(
+            dataset['wm_potentials']
+        ).reshape(-1)
+        return {
+            'observations': dataset['observations'][start_indices],
+            'actions': dataset['actions'][action_indices],
+            'wm_potential_deltas': (
+                potentials[start_indices + horizon_length]
+                - potentials[start_indices]
+            ).astype(np.float32),
+        }
+
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
     
@@ -310,8 +411,10 @@ def main(_):
     world_model_value = None
     world_model_progress = None
     world_model_potential = None
+    world_model_delta = None
     progress_train_class_indices = None
     potential_train_bin_indices = None
+    delta_train_class_indices = None
     if config.get('wm_enabled', False):
         world_model = WorldModelTrainState.create(
             seed=FLAGS.seed + 1,
@@ -431,6 +534,40 @@ def main(_):
             f'{potential_bin_counts}.',
             flush=True,
         )
+    if config.get('wm_delta_enabled', False):
+        if world_model is None:
+            raise ValueError('wm_delta_enabled requires wm_enabled=True')
+        delta_train_class_indices, delta_values = get_delta_start_groups(
+            train_dataset
+        )
+        delta_target_mean = float(delta_values.mean())
+        delta_target_std = float(delta_values.std())
+        if delta_target_std <= 0:
+            raise ValueError('Potential delta labels have zero variance')
+        example_action_chunk = np.stack(
+            [example_batch['actions']] * FLAGS.horizon_length,
+            axis=-2,
+        )
+        world_model_delta = LatentPotentialDeltaTrainState.create(
+            seed=FLAGS.seed + 5,
+            latent_dim=config['wm_latent_dim'],
+            example_action_chunk=example_action_chunk,
+            hidden_dims=config['wm_delta_hidden_dims'],
+            learning_rate=config['wm_delta_lr'],
+            coef=config['wm_delta_coef'],
+            target_mean=delta_target_mean,
+            target_std=delta_target_std,
+            nontrivial_threshold=config[
+                'wm_delta_nontrivial_threshold'
+            ],
+        )
+        print(
+            'Initialized diagnostic latent potential-delta head with '
+            f'mean {delta_target_mean:.6f}, std '
+            f'{delta_target_std:.6f}, and decrease/neutral/increase '
+            f'counts {[len(group) for group in delta_train_class_indices]}.',
+            flush=True,
+        )
 
     value_validation_batch = None
     if world_model_value is not None:
@@ -528,6 +665,35 @@ def main(_):
         )
         np.random.set_state(numpy_rng_state)
 
+    delta_validation_batch = None
+    if world_model_delta is not None:
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 50_000)
+        delta_validation_dataset = Dataset.create(
+            **add_cube_potential_labels(val_dataset)
+        )
+        delta_validation_groups, _ = get_delta_start_groups(
+            delta_validation_dataset
+        )
+        delta_validation_starts = np.concatenate(
+            [
+                np.random.choice(
+                    group,
+                    size=config['wm_delta_validation_per_class'],
+                    replace=(
+                        len(group)
+                        < config['wm_delta_validation_per_class']
+                    ),
+                )
+                for group in delta_validation_groups
+            ]
+        )
+        np.random.shuffle(delta_validation_starts)
+        delta_validation_batch = make_delta_batch(
+            delta_validation_dataset, delta_validation_starts
+        )
+        np.random.set_state(numpy_rng_state)
+
     if FLAGS.restore_file is not None:
         restored = restore_agent_with_file(
             agent,
@@ -536,6 +702,7 @@ def main(_):
             world_model_value=world_model_value,
             world_model_progress=world_model_progress,
             world_model_potential=world_model_potential,
+            world_model_delta=world_model_delta,
         )
         restored_states = iter(
             restored if isinstance(restored, tuple) else (restored,)
@@ -549,6 +716,8 @@ def main(_):
             world_model_progress = next(restored_states)
         if world_model_potential is not None:
             world_model_potential = next(restored_states)
+        if world_model_delta is not None:
+            world_model_delta = next(restored_states)
         print(
             f"Restored checkpoint from {FLAGS.restore_file} "
             f"at global step {FLAGS.restore_step}",
@@ -606,6 +775,38 @@ def main(_):
             print(
                 "Evaluation-only world-model scoring enabled with "
                 f"lambda={FLAGS.wm_score_lambda}.",
+                flush=True,
+            )
+
+        elif FLAGS.wm_delta_score_eval_enabled:
+            if world_model is None or world_model_delta is None:
+                raise ValueError(
+                    "--wm_delta_score_eval_enabled requires wm_enabled=True "
+                    "and wm_delta_enabled=True"
+                )
+            if config["actor_type"] != "best-of-n":
+                raise ValueError(
+                    "--wm_delta_score_eval_enabled requires "
+                    "actor_type=best-of-n"
+                )
+            if not config["action_chunking"]:
+                raise ValueError(
+                    "--wm_delta_score_eval_enabled requires "
+                    "action_chunking=True"
+                )
+            if FLAGS.wm_delta_score_lambda < 0:
+                raise ValueError(
+                    "--wm_delta_score_lambda must be non-negative"
+                )
+            sample_actions_fn = functools.partial(
+                world_model_delta.sample_actions,
+                world_model=world_model,
+                agent=agent,
+                score_lambda=FLAGS.wm_delta_score_lambda,
+            )
+            print(
+                "Evaluation-only world-model delta scoring enabled with "
+                f"lambda={FLAGS.wm_delta_score_lambda}.",
                 flush=True,
             )
 
@@ -678,9 +879,12 @@ def main(_):
         elif world_model_progress is not None:
             candidate_head = world_model_progress
             candidate_head_name = "latent progress"
-        else:
+        elif world_model_potential is not None:
             candidate_head = world_model_potential
             candidate_head_name = "latent potential"
+        else:
+            candidate_head = world_model_delta
+            candidate_head_name = "latent potential delta"
         if world_model is None or candidate_head is None:
             raise ValueError(
                 "--candidate_diagnostic_only requires wm_enabled=True and "
@@ -864,6 +1068,10 @@ def main(_):
                 future_info = candidate_head.evaluate_predicted_future(
                     future_batch, world_model
                 )
+            elif candidate_head_name == "latent potential delta":
+                future_info = candidate_head.evaluate(
+                    delta_validation_batch, world_model
+                )
 
             for _ in range(FLAGS.candidate_diagnostic_batches):
                 diagnostic_batch = diagnostic_dataset.sample(
@@ -911,6 +1119,8 @@ def main(_):
                 "progress_choice_critic_percentile",
                 "critic_choice_potential_percentile",
                 "potential_choice_critic_percentile",
+                "critic_choice_delta_percentile",
+                "delta_choice_critic_percentile",
             )
             if key in candidate_info
         ]
@@ -958,7 +1168,7 @@ def main(_):
                 compact_dataset=False,
                 dataset_only=True,
                 cur_env=env,
-                add_info=config.get('wm_potential_enabled', False),
+                add_info=cube_aux_enabled,
             )
             train_dataset = process_train_dataset(train_dataset)
             if FLAGS.wm_progress_only:
@@ -999,6 +1209,10 @@ def main(_):
                     )
                     if np.any(replacement_bin_ids == bin_index)
                 ]
+            if FLAGS.wm_delta_only:
+                delta_train_class_indices, _ = get_delta_start_groups(
+                    train_dataset
+                )
 
         if FLAGS.wm_progress_only:
             num_present_classes = len(progress_train_class_indices)
@@ -1050,6 +1264,28 @@ def main(_):
                 len(potential_batch_indices),
                 idxs=potential_batch_indices,
             )
+        elif FLAGS.wm_delta_only:
+            num_delta_classes = len(delta_train_class_indices)
+            base_size, remainder = divmod(
+                config['batch_size'], num_delta_classes
+            )
+            delta_batch_starts = []
+            for position, class_starts in enumerate(
+                delta_train_class_indices
+            ):
+                class_batch_size = base_size + (position < remainder)
+                delta_batch_starts.append(
+                    np.random.choice(
+                        class_starts,
+                        size=class_batch_size,
+                        replace=len(class_starts) < class_batch_size,
+                    )
+                )
+            delta_batch_starts = np.concatenate(delta_batch_starts)
+            np.random.shuffle(delta_batch_starts)
+            batch = make_delta_batch(
+                train_dataset, delta_batch_starts
+            )
         else:
             batch = train_dataset.sample_sequence(
                 config['batch_size'],
@@ -1057,7 +1293,11 @@ def main(_):
                 discount=discount,
             )
 
-        if FLAGS.wm_progress_only or FLAGS.wm_potential_only:
+        if (
+            FLAGS.wm_progress_only
+            or FLAGS.wm_potential_only
+            or FLAGS.wm_delta_only
+        ):
             offline_info = {}
         else:
             agent, offline_info = agent.update(batch)
@@ -1086,6 +1326,7 @@ def main(_):
         if (
             world_model_progress is not None
             and not FLAGS.wm_potential_only
+            and not FLAGS.wm_delta_only
         ):
             world_model_progress, progress_info = (
                 world_model_progress.update(batch, world_model)
@@ -1100,6 +1341,7 @@ def main(_):
         if (
             world_model_potential is not None
             and not FLAGS.wm_progress_only
+            and not FLAGS.wm_delta_only
         ):
             world_model_potential, potential_info = (
                 world_model_potential.update(batch, world_model)
@@ -1109,6 +1351,17 @@ def main(_):
                 **{
                     f'world_model_potential/{key}': value
                     for key, value in potential_info.items()
+                },
+            }
+        if world_model_delta is not None:
+            world_model_delta, delta_info = world_model_delta.update(
+                batch, world_model
+            )
+            offline_info = {
+                **offline_info,
+                **{
+                    f'world_model_delta/{key}': value
+                    for key, value in delta_info.items()
                 },
             }
 
@@ -1148,6 +1401,17 @@ def main(_):
                         for key, value in potential_heldout_info.items()
                     },
                 }
+            if world_model_delta is not None:
+                delta_heldout_info = world_model_delta.evaluate(
+                    delta_validation_batch, world_model
+                )
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model_delta/heldout_{key}': value
+                        for key, value in delta_heldout_info.items()
+                    },
+                }
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -1160,6 +1424,7 @@ def main(_):
                 world_model_value=world_model_value,
                 world_model_progress=world_model_progress,
                 world_model_potential=world_model_potential,
+                world_model_delta=world_model_delta,
             )
 
         # eval
@@ -1376,6 +1641,7 @@ def main(_):
                 world_model_value=world_model_value,
                 world_model_progress=world_model_progress,
                 world_model_potential=world_model_potential,
+                world_model_delta=world_model_delta,
             )
 
     end_time = time.time()
