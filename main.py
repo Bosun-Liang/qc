@@ -27,7 +27,11 @@ from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate, flatten
 from agents import agents
-from agents.world_model import LatentValueTrainState, WorldModelTrainState
+from agents.world_model import (
+    LatentProgressTrainState,
+    LatentValueTrainState,
+    WorldModelTrainState,
+)
 import numpy as np
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -46,12 +50,17 @@ flags.DEFINE_bool('eval_only', False, 'Only evaluate the restored checkpoint and
 flags.DEFINE_bool(
     'candidate_diagnostic_only',
     False,
-    'Only compare critic and latent-value rankings on best-of-N candidates.',
+    'Only compare critic and an enabled latent head on best-of-N candidates.',
 )
 flags.DEFINE_integer(
     'candidate_diagnostic_batches',
     16,
     'Number of held-out batches used by candidate_diagnostic_only.',
+)
+flags.DEFINE_bool(
+    'wm_progress_only',
+    False,
+    'Freeze agent/world-model states and train only the progress head.',
 )
 flags.DEFINE_bool(
     'wm_score_eval_enabled',
@@ -124,6 +133,15 @@ def main(_):
         raise ValueError(
             "--wm_score_eval_enabled is restricted to --eval_only=True"
         )
+    if FLAGS.wm_progress_only:
+        if FLAGS.restore_file is None:
+            raise ValueError("--wm_progress_only requires --restore_file")
+        if FLAGS.online_steps != 0:
+            raise ValueError("--wm_progress_only requires --online_steps=0")
+        if not config.get('wm_progress_enabled', False):
+            raise ValueError(
+                "--wm_progress_only requires wm_progress_enabled=True"
+            )
     
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
@@ -221,6 +239,8 @@ def main(_):
 
     world_model = None
     world_model_value = None
+    world_model_progress = None
+    progress_train_class_indices = None
     if config.get('wm_enabled', False):
         world_model = WorldModelTrainState.create(
             seed=FLAGS.seed + 1,
@@ -244,6 +264,58 @@ def main(_):
             coef=config['wm_value_coef'],
         )
         print('Initialized diagnostic latent value head.', flush=True)
+    if config.get('wm_progress_enabled', False):
+        if world_model is None:
+            raise ValueError('wm_progress_enabled requires wm_enabled=True')
+        progress_num_classes = config['wm_progress_num_classes']
+        progress_labels = np.clip(
+            np.rint(np.asarray(train_dataset['rewards']) + 3.0).astype(int),
+            0,
+            progress_num_classes - 1,
+        )
+        progress_counts = np.bincount(
+            progress_labels, minlength=progress_num_classes
+        )
+        present_counts = progress_counts[progress_counts > 0]
+        if len(present_counts) == 0:
+            raise ValueError('No progress labels were found in the dataset')
+        progress_train_class_indices = [
+            np.flatnonzero(progress_labels == class_index)
+            for class_index in range(progress_num_classes)
+            if progress_counts[class_index] > 0
+        ]
+        if FLAGS.wm_progress_only:
+            # The progress-only diagnostic uses balanced sampling below, so
+            # additional loss weighting would count class imbalance twice.
+            progress_class_weights = np.ones(progress_num_classes)
+            progress_sampling = 'balanced transition sampling'
+        else:
+            safe_counts = np.where(
+                progress_counts > 0,
+                progress_counts,
+                present_counts.min(),
+            )
+            progress_class_weights = 1.0 / np.sqrt(
+                safe_counts.astype(float)
+            )
+            progress_class_weights /= progress_class_weights.mean()
+            progress_sampling = 'natural sequence sampling'
+        world_model_progress = LatentProgressTrainState.create(
+            seed=FLAGS.seed + 3,
+            latent_dim=config['wm_latent_dim'],
+            hidden_dims=config['wm_progress_hidden_dims'],
+            learning_rate=config['wm_progress_lr'],
+            coef=config['wm_progress_coef'],
+            class_weights=tuple(progress_class_weights.tolist()),
+            num_classes=progress_num_classes,
+        )
+        print(
+            'Initialized diagnostic latent progress head with '
+            f'class counts {progress_counts.tolist()} and weights '
+            f'{progress_class_weights.tolist()} using '
+            f'{progress_sampling}.',
+            flush=True,
+        )
 
     value_validation_batch = None
     if world_model_value is not None:
@@ -257,19 +329,63 @@ def main(_):
         )
         np.random.set_state(numpy_rng_state)
 
+    progress_validation_batch = None
+    if world_model_progress is not None:
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 30_000)
+        progress_validation_dataset = Dataset.create(**val_dataset)
+        validation_rewards = np.asarray(
+            progress_validation_dataset['rewards']
+        )
+        validation_labels = np.clip(
+            np.rint(validation_rewards + 3.0).astype(int),
+            0,
+            config['wm_progress_num_classes'] - 1,
+        )
+        validation_indices = []
+        for class_index in range(config['wm_progress_num_classes']):
+            class_indices = np.flatnonzero(
+                validation_labels == class_index
+            )
+            if len(class_indices) == 0:
+                continue
+            validation_indices.append(
+                np.random.choice(
+                    class_indices,
+                    size=config['wm_progress_validation_per_class'],
+                    replace=(
+                        len(class_indices)
+                        < config['wm_progress_validation_per_class']
+                    ),
+                )
+            )
+        if not validation_indices:
+            raise ValueError('No progress validation labels were found')
+        validation_indices = np.concatenate(validation_indices)
+        np.random.shuffle(validation_indices)
+        progress_validation_batch = progress_validation_dataset.sample(
+            len(validation_indices), idxs=validation_indices
+        )
+        np.random.set_state(numpy_rng_state)
+
     if FLAGS.restore_file is not None:
         restored = restore_agent_with_file(
             agent,
             FLAGS.restore_file,
             world_model=world_model,
             world_model_value=world_model_value,
+            world_model_progress=world_model_progress,
         )
-        if world_model is None:
-            agent = restored
-        elif world_model_value is None:
-            agent, world_model = restored
-        else:
-            agent, world_model, world_model_value = restored
+        restored_states = iter(
+            restored if isinstance(restored, tuple) else (restored,)
+        )
+        agent = next(restored_states)
+        if world_model is not None:
+            world_model = next(restored_states)
+        if world_model_value is not None:
+            world_model_value = next(restored_states)
+        if world_model_progress is not None:
+            world_model_progress = next(restored_states)
         print(
             f"Restored checkpoint from {FLAGS.restore_file} "
             f"at global step {FLAGS.restore_step}",
@@ -393,10 +509,20 @@ def main(_):
             raise ValueError(
                 "--candidate_diagnostic_only requires --restore_file"
             )
-        if world_model is None or world_model_value is None:
+        candidate_head = (
+            world_model_value
+            if world_model_value is not None
+            else world_model_progress
+        )
+        candidate_head_name = (
+            "latent value"
+            if world_model_value is not None
+            else "latent progress"
+        )
+        if world_model is None or candidate_head is None:
             raise ValueError(
                 "--candidate_diagnostic_only requires wm_enabled=True and "
-                "wm_value_enabled=True"
+                "either wm_value_enabled=True or wm_progress_enabled=True"
             )
         if config["actor_type"] != "best-of-n":
             raise ValueError(
@@ -414,7 +540,83 @@ def main(_):
         np.random.seed(FLAGS.seed + 20_000)
         diagnostic_rng = jax.random.PRNGKey(FLAGS.seed + 20_000)
         candidate_infos = []
+        future_info = None
         try:
+            if candidate_head_name == "latent progress":
+                horizon_length = config["horizon_length"]
+                max_start = diagnostic_dataset.size - horizon_length
+                terminals = np.asarray(
+                    diagnostic_dataset["terminals"]
+                ).reshape(-1)
+                terminal_prefix = np.concatenate(
+                    ([0], np.cumsum(terminals > 0))
+                )
+                terminal_counts = (
+                    terminal_prefix[
+                        horizon_length:horizon_length + max_start
+                    ]
+                    - terminal_prefix[:max_start]
+                )
+                valid_starts = np.flatnonzero(terminal_counts == 0)
+                future_rewards = np.asarray(
+                    diagnostic_dataset["rewards"]
+                ).reshape(-1)[valid_starts + horizon_length]
+                future_labels = np.clip(
+                    np.rint(future_rewards + 3.0).astype(int),
+                    0,
+                    config["wm_progress_num_classes"] - 1,
+                )
+                future_starts = []
+                for class_index in range(
+                    config["wm_progress_num_classes"]
+                ):
+                    class_starts = valid_starts[
+                        future_labels == class_index
+                    ]
+                    if len(class_starts) == 0:
+                        continue
+                    future_starts.append(
+                        np.random.choice(
+                            class_starts,
+                            size=config[
+                                "wm_progress_validation_per_class"
+                            ],
+                            replace=(
+                                len(class_starts)
+                                < config[
+                                    "wm_progress_validation_per_class"
+                                ]
+                            ),
+                        )
+                    )
+                if not future_starts:
+                    raise ValueError(
+                        "No terminal-valid future progress samples found"
+                    )
+                future_starts = np.concatenate(future_starts)
+                np.random.shuffle(future_starts)
+                action_indices = (
+                    future_starts[:, None]
+                    + np.arange(horizon_length)[None, :]
+                )
+                future_batch = {
+                    "observations": diagnostic_dataset["observations"][
+                        future_starts
+                    ],
+                    "actions": diagnostic_dataset["actions"][
+                        action_indices
+                    ],
+                    "target_observations": diagnostic_dataset[
+                        "next_observations"
+                    ][future_starts + horizon_length - 1],
+                    "target_rewards": diagnostic_dataset["rewards"][
+                        future_starts + horizon_length
+                    ],
+                }
+                future_info = candidate_head.evaluate_predicted_future(
+                    future_batch, world_model
+                )
+
             for _ in range(FLAGS.candidate_diagnostic_batches):
                 diagnostic_batch = diagnostic_dataset.sample(
                     config["batch_size"]
@@ -423,7 +625,7 @@ def main(_):
                     diagnostic_rng
                 )
                 candidate_infos.append(
-                    world_model_value.evaluate_candidates(
+                    candidate_head.evaluate_candidates(
                         diagnostic_batch["observations"],
                         world_model,
                         agent,
@@ -441,13 +643,26 @@ def main(_):
             lambda *values: np.std(np.asarray(values), axis=0),
             *candidate_infos,
         )
+        if future_info is not None:
+            candidate_info.update(
+                {
+                    f"future_{key}": np.asarray(value)
+                    for key, value in future_info.items()
+                }
+            )
         batch_std_keys = [
-            "spearman_correlation",
-            "score_correlation",
-            "top1_agreement",
-            "topk_overlap",
-            "critic_choice_value_percentile",
-            "value_choice_critic_percentile",
+            key
+            for key in (
+                "spearman_correlation",
+                "score_correlation",
+                "top1_agreement",
+                "topk_overlap",
+                "critic_choice_value_percentile",
+                "value_choice_critic_percentile",
+                "critic_choice_progress_percentile",
+                "progress_choice_critic_percentile",
+            )
+            if key in candidate_info
         ]
         batch_std_keys.extend(
             key
@@ -459,7 +674,10 @@ def main(_):
         for key in batch_std_keys:
             candidate_info[f"{key}_batch_std"] = candidate_batch_std[key]
 
-        print("Read-only candidate ranking diagnostic:", flush=True)
+        print(
+            f"Read-only {candidate_head_name} candidate ranking diagnostic:",
+            flush=True,
+        )
         for key in sorted(candidate_info):
             print(
                 f"  {key}: {float(candidate_info[key]):.6f}",
@@ -492,30 +710,89 @@ def main(_):
                 cur_env=env,
             )
             train_dataset = process_train_dataset(train_dataset)
+            if FLAGS.wm_progress_only:
+                replacement_labels = np.clip(
+                    np.rint(
+                        np.asarray(train_dataset['rewards']) + 3.0
+                    ).astype(int),
+                    0,
+                    config['wm_progress_num_classes'] - 1,
+                )
+                progress_train_class_indices = [
+                    np.flatnonzero(replacement_labels == class_index)
+                    for class_index in range(
+                        config['wm_progress_num_classes']
+                    )
+                    if np.any(replacement_labels == class_index)
+                ]
 
-        batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
+        if FLAGS.wm_progress_only:
+            num_present_classes = len(progress_train_class_indices)
+            base_size, remainder = divmod(
+                config['batch_size'], num_present_classes
+            )
+            progress_batch_indices = []
+            for position, class_indices in enumerate(
+                progress_train_class_indices
+            ):
+                class_batch_size = base_size + (position < remainder)
+                progress_batch_indices.append(
+                    np.random.choice(
+                        class_indices,
+                        size=class_batch_size,
+                        replace=len(class_indices) < class_batch_size,
+                    )
+                )
+            progress_batch_indices = np.concatenate(
+                progress_batch_indices
+            )
+            np.random.shuffle(progress_batch_indices)
+            batch = train_dataset.sample(
+                len(progress_batch_indices),
+                idxs=progress_batch_indices,
+            )
+        else:
+            batch = train_dataset.sample_sequence(
+                config['batch_size'],
+                sequence_length=FLAGS.horizon_length,
+                discount=discount,
+            )
 
-        agent, offline_info = agent.update(batch)
-        if world_model is not None:
-            world_model, world_model_info = world_model.update(batch)
-            offline_info = {
-                **offline_info,
-                **{
-                    f'world_model/{key}': value
-                    for key, value in world_model_info.items()
-                },
-            }
-        if world_model_value is not None:
-            world_model_value, value_info = world_model_value.update(
-                batch,
-                world_model,
-                agent,
+        if FLAGS.wm_progress_only:
+            offline_info = {}
+        else:
+            agent, offline_info = agent.update(batch)
+            if world_model is not None:
+                world_model, world_model_info = world_model.update(batch)
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model/{key}': value
+                        for key, value in world_model_info.items()
+                    },
+                }
+            if world_model_value is not None:
+                world_model_value, value_info = world_model_value.update(
+                    batch,
+                    world_model,
+                    agent,
+                )
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model_value/{key}': value
+                        for key, value in value_info.items()
+                    },
+                }
+        if world_model_progress is not None:
+            world_model_progress, progress_info = (
+                world_model_progress.update(batch, world_model)
             )
             offline_info = {
                 **offline_info,
                 **{
-                    f'world_model_value/{key}': value
-                    for key, value in value_info.items()
+                    f'world_model_progress/{key}': value
+                    for key, value in progress_info.items()
                 },
             }
 
@@ -533,6 +810,17 @@ def main(_):
                         for key, value in heldout_info.items()
                     },
                 }
+            if world_model_progress is not None:
+                progress_heldout_info = world_model_progress.evaluate(
+                    progress_validation_batch, world_model
+                )
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model_progress/heldout_{key}': value
+                        for key, value in progress_heldout_info.items()
+                    },
+                }
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -543,6 +831,7 @@ def main(_):
                 log_step,
                 world_model=world_model,
                 world_model_value=world_model_value,
+                world_model_progress=world_model_progress,
             )
 
         # eval
@@ -678,6 +967,17 @@ def main(_):
                         for key, value in value_info.items()
                     },
                 }
+            if world_model_progress is not None:
+                world_model_progress, progress_info = (
+                    world_model_progress.batch_update(batch, world_model)
+                )
+                agent_info = {
+                    **agent_info,
+                    **{
+                        f'world_model_progress/{key}': value
+                        for key, value in progress_info.items()
+                    },
+                }
             update_info["online_agent"] = agent_info
             
         if i % FLAGS.log_interval == 0:
@@ -695,6 +995,20 @@ def main(_):
                     **{
                         f'world_model_value/heldout_{key}': value
                         for key, value in heldout_info.items()
+                    },
+                }
+            if (
+                world_model_progress is not None
+                and "online_agent" in update_info
+            ):
+                progress_heldout_info = world_model_progress.evaluate(
+                    progress_validation_batch, world_model
+                )
+                update_info["online_agent"] = {
+                    **update_info["online_agent"],
+                    **{
+                        f'world_model_progress/heldout_{key}': value
+                        for key, value in progress_heldout_info.items()
                     },
                 }
             for key, info in update_info.items():
@@ -732,6 +1046,7 @@ def main(_):
                 log_step,
                 world_model=world_model,
                 world_model_value=world_model_value,
+                world_model_progress=world_model_progress,
             )
 
     end_time = time.time()

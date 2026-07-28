@@ -349,6 +349,12 @@ def get_config():
             wm_value_coef=1.0,
             wm_value_hidden_dims=(256, 256),
             wm_value_lr=3e-4,
+            wm_progress_enabled=False,
+            wm_progress_coef=1.0,
+            wm_progress_hidden_dims=(256, 256),
+            wm_progress_lr=3e-4,
+            wm_progress_num_classes=4,
+            wm_progress_validation_per_class=256,
         )
     )
     return config

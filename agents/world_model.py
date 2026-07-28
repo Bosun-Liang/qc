@@ -59,6 +59,20 @@ class LatentValueHead(nn.Module):
         )(latents).squeeze(-1)
 
 
+class LatentProgressHead(nn.Module):
+    """Classify task progress from an observation latent."""
+
+    hidden_dims: Sequence[int]
+    num_classes: int = 4
+
+    @nn.compact
+    def __call__(self, latents):
+        return MLP(
+            (*self.hidden_dims, self.num_classes),
+            activate_final=False,
+        )(latents)
+
+
 class WorldModel(nn.Module):
     """Encode observations and predict the latent after an action chunk."""
 
@@ -81,6 +95,10 @@ class WorldModel(nn.Module):
         flat_actions = actions.reshape((*actions.shape[:-2], -1))
         predicted_latents = self.dynamics(latents, flat_actions)
         return predicted_latents, target_latents
+
+    def encode(self, observations):
+        """Encode observations without running chunk dynamics."""
+        return self.encoder(observations)
 
 
 def world_model_loss(apply_fn, params, batch):
@@ -679,3 +697,495 @@ class LatentValueTrainState(flax.struct.PyTreeNode):
         )[jnp.arange(batch_size), flat_indices, :].reshape(
             batch_shape + (flat_action_dim,)
         )
+
+class LatentProgressTrainState(flax.struct.PyTreeNode):
+    """Independent class-balanced task-progress diagnostic head.
+
+    The head is supervised on real observation latents and never updates the
+    world model, actor, or critic. Reward classes -3, -2, -1, and 0 map to
+    progress classes 0, 1, 2, and 3 respectively.
+    """
+
+    network: Any
+    coef: float = nonpytree_field()
+    class_weights: Any = nonpytree_field()
+    num_classes: int = nonpytree_field()
+
+    @classmethod
+    def create(
+        cls,
+        seed,
+        latent_dim=64,
+        hidden_dims=(256, 256),
+        learning_rate=3e-4,
+        coef=1.0,
+        class_weights=(1.0, 1.0, 1.0, 1.0),
+        num_classes=4,
+    ):
+        if len(class_weights) != num_classes:
+            raise ValueError(
+                "class_weights length must match num_classes"
+            )
+        model = LatentProgressHead(
+            hidden_dims=hidden_dims,
+            num_classes=num_classes,
+        )
+        params = model.init(
+            jax.random.PRNGKey(seed),
+            jnp.zeros((latent_dim,), dtype=jnp.float32),
+        )["params"]
+        network = TrainState.create(
+            model_def=model,
+            params=params,
+            tx=optax.adam(learning_rate=learning_rate),
+        )
+        return cls(
+            network=network,
+            coef=coef,
+            class_weights=tuple(float(x) for x in class_weights),
+            num_classes=num_classes,
+        )
+
+    def progress_loss(self, batch, world_model, params):
+        latents = world_model.network(
+            batch["observations"], method="encode"
+        )
+        latents = jax.lax.stop_gradient(latents)
+        logits = self.network(latents, params=params)
+
+        rewards = batch["rewards"]
+        if rewards.ndim > 1:
+            rewards = rewards[..., 0]
+        labels = jnp.clip(
+            jnp.rint(rewards + 3.0).astype(jnp.int32),
+            0,
+            self.num_classes - 1,
+        )
+        if "valid" in batch:
+            valid = batch["valid"]
+            if valid.ndim > 1:
+                valid = valid[..., 0]
+            valid = valid.astype(logits.dtype)
+        else:
+            valid = jnp.ones(labels.shape, dtype=logits.dtype)
+
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        per_sample_loss = -jnp.take_along_axis(
+            log_probs, labels[..., None], axis=-1
+        ).squeeze(-1)
+        class_weights = jnp.asarray(
+            self.class_weights, dtype=logits.dtype
+        )
+        sample_weights = class_weights[labels] * valid
+        weight_sum = jnp.maximum(
+            jnp.sum(sample_weights),
+            jnp.asarray(1.0, dtype=logits.dtype),
+        )
+        loss = jnp.sum(per_sample_loss * sample_weights) / weight_sum
+
+        probabilities = jax.nn.softmax(logits, axis=-1)
+        progress_values = jnp.arange(
+            self.num_classes, dtype=logits.dtype
+        )
+        predicted_progress = jnp.sum(
+            probabilities * progress_values, axis=-1
+        )
+        target_progress = labels.astype(logits.dtype)
+        predictions = jnp.argmax(logits, axis=-1)
+        valid_count = jnp.maximum(
+            jnp.sum(valid),
+            jnp.asarray(1.0, dtype=logits.dtype),
+        )
+        accuracy = jnp.sum(
+            (predictions == labels).astype(logits.dtype) * valid
+        ) / valid_count
+        mae = jnp.sum(
+            jnp.abs(predicted_progress - target_progress) * valid
+        ) / valid_count
+
+        prediction_mean = jnp.sum(predicted_progress * valid) / valid_count
+        target_mean = jnp.sum(target_progress * valid) / valid_count
+        centered_predictions = predicted_progress - prediction_mean
+        centered_targets = target_progress - target_mean
+        covariance = jnp.sum(
+            centered_predictions * centered_targets * valid
+        ) / valid_count
+        prediction_variance = jnp.sum(
+            jnp.square(centered_predictions) * valid
+        ) / valid_count
+        target_variance = jnp.sum(
+            jnp.square(centered_targets) * valid
+        ) / valid_count
+        correlation = covariance / jnp.sqrt(
+            prediction_variance * target_variance
+        ).clip(1e-8)
+
+        info = {
+            "loss": loss,
+            "accuracy": accuracy,
+            "mae": mae,
+            "correlation": correlation,
+            "prediction_mean": prediction_mean,
+            "prediction_std": jnp.sqrt(
+                jnp.maximum(prediction_variance, 0.0)
+            ),
+            "target_mean": target_mean,
+            "target_std": jnp.sqrt(jnp.maximum(target_variance, 0.0)),
+            "valid_fraction": valid.mean(),
+        }
+        balanced_accuracy = jnp.asarray(0.0, dtype=logits.dtype)
+        present_classes = jnp.asarray(0.0, dtype=logits.dtype)
+        for class_index in range(self.num_classes):
+            class_mask = (labels == class_index).astype(logits.dtype) * valid
+            class_count = jnp.sum(class_mask)
+            class_present = (class_count > 0).astype(logits.dtype)
+            recall = jnp.sum(
+                (predictions == class_index).astype(logits.dtype)
+                * class_mask
+            ) / jnp.maximum(
+                class_count, jnp.asarray(1.0, dtype=logits.dtype)
+            )
+            info[f"class_{class_index}_fraction"] = (
+                class_count / valid_count
+            )
+            info[f"class_{class_index}_recall"] = recall
+            balanced_accuracy = (
+                balanced_accuracy + recall * class_present
+            )
+            present_classes = present_classes + class_present
+        info["balanced_accuracy"] = balanced_accuracy / jnp.maximum(
+            present_classes, jnp.asarray(1.0, dtype=logits.dtype)
+        )
+        info["is_finite"] = jnp.logical_and(
+            jnp.all(jnp.isfinite(logits)),
+            jnp.all(
+                jnp.isfinite(
+                    jnp.asarray((loss, accuracy, mae, correlation))
+                )
+            ),
+        )
+        return loss, info
+
+    @staticmethod
+    def _update(state, batch, world_model):
+        def loss_fn(params):
+            loss, info = state.progress_loss(batch, world_model, params)
+            weighted_loss = state.coef * loss
+            info["weighted_loss"] = weighted_loss
+            return weighted_loss, info
+
+        network, info = state.network.apply_loss_fn(loss_fn)
+        return state.replace(network=network), info
+
+    @jax.jit
+    def update(self, batch, world_model):
+        """Apply one progress-head optimizer update."""
+        return self._update(self, batch, world_model)
+
+    @jax.jit
+    def batch_update(self, batch, world_model):
+        """Apply one progress-head update per leading UTD entry."""
+
+        def scan_update(state, scan_batch):
+            return self._update(state, scan_batch, world_model)
+
+        state, infos = jax.lax.scan(scan_update, self, batch)
+        infos = jax.tree_util.tree_map(lambda value: value.mean(), infos)
+        return state, infos
+
+    @jax.jit
+    def evaluate(self, batch, world_model):
+        """Evaluate task-progress metrics without changing state."""
+        _, info = self.progress_loss(
+            batch, world_model, self.network.params
+        )
+        return info
+
+    @jax.jit
+    def evaluate_predicted_future(self, batch, world_model):
+        """Evaluate progress after composing dynamics with the head.
+
+        The supplied action chunks and future observations come from held-out
+        data. This is read-only and separates dynamics-to-head composition
+        quality from classification on directly encoded observations.
+        """
+        predicted_latents, target_latents = world_model.network(
+            batch["observations"],
+            batch["actions"],
+            batch["target_observations"],
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        target_latents = jax.lax.stop_gradient(target_latents)
+        predicted_logits = self.network(predicted_latents)
+        encoded_logits = self.network(target_latents)
+        predicted_probabilities = jax.nn.softmax(
+            predicted_logits, axis=-1
+        )
+        encoded_probabilities = jax.nn.softmax(encoded_logits, axis=-1)
+        progress_values = jnp.arange(
+            self.num_classes, dtype=predicted_logits.dtype
+        )
+        predicted_scores = jnp.sum(
+            predicted_probabilities * progress_values, axis=-1
+        )
+        encoded_scores = jnp.sum(
+            encoded_probabilities * progress_values, axis=-1
+        )
+        labels = jnp.clip(
+            jnp.rint(batch["target_rewards"] + 3.0).astype(jnp.int32),
+            0,
+            self.num_classes - 1,
+        )
+        targets = labels.astype(predicted_scores.dtype)
+        predictions = jnp.argmax(predicted_logits, axis=-1)
+
+        def correlation(left, right):
+            left = left - left.mean()
+            right = right - right.mean()
+            return jnp.sum(left * right) / jnp.sqrt(
+                jnp.sum(jnp.square(left)) * jnp.sum(jnp.square(right))
+            ).clip(1e-8)
+
+        info = {
+            "accuracy": jnp.mean((predictions == labels).astype(
+                predicted_scores.dtype
+            )),
+            "mae": jnp.mean(jnp.abs(predicted_scores - targets)),
+            "correlation": correlation(predicted_scores, targets),
+            "prediction_mean": jnp.mean(predicted_scores),
+            "prediction_std": jnp.std(predicted_scores),
+            "encoded_mean": jnp.mean(encoded_scores),
+            "encoded_std": jnp.std(encoded_scores),
+            "score_vs_encoded_mae": jnp.mean(
+                jnp.abs(predicted_scores - encoded_scores)
+            ),
+            "score_vs_encoded_correlation": correlation(
+                predicted_scores, encoded_scores
+            ),
+            "latent_mse": jnp.mean(
+                jnp.square(predicted_latents - target_latents)
+            ),
+            "latent_cosine": jnp.mean(
+                jnp.sum(predicted_latents * target_latents, axis=-1)
+                / (
+                    jnp.linalg.norm(predicted_latents, axis=-1)
+                    * jnp.linalg.norm(target_latents, axis=-1)
+                ).clip(1e-8)
+            ),
+        }
+        balanced_accuracy = jnp.asarray(
+            0.0, dtype=predicted_scores.dtype
+        )
+        present_classes = jnp.asarray(
+            0.0, dtype=predicted_scores.dtype
+        )
+        for class_index in range(self.num_classes):
+            class_mask = labels == class_index
+            class_count = jnp.sum(class_mask)
+            class_present = (class_count > 0).astype(
+                predicted_scores.dtype
+            )
+            recall = jnp.sum(
+                (predictions == class_index).astype(predicted_scores.dtype)
+                * class_mask.astype(predicted_scores.dtype)
+            ) / jnp.maximum(
+                class_count,
+                jnp.asarray(1, dtype=class_count.dtype),
+            )
+            info[f"class_{class_index}_recall"] = recall
+            balanced_accuracy += recall * class_present
+            present_classes += class_present
+        info["balanced_accuracy"] = balanced_accuracy / jnp.maximum(
+            present_classes,
+            jnp.asarray(1.0, dtype=predicted_scores.dtype),
+        )
+        info["is_finite"] = jnp.logical_and(
+            jnp.all(jnp.isfinite(predicted_logits)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(encoded_logits)),
+                jnp.all(
+                    jnp.isfinite(
+                        jnp.asarray(tuple(info.values()))
+                    )
+                ),
+            ),
+        )
+        return info
+
+    @jax.jit
+    def evaluate_candidates(self, observations, world_model, agent, rng):
+        """Compare critic and predicted-progress candidate rankings.
+
+        This method is read-only. It generates the same best-of-N action
+        candidates as the policy, but only returns aggregate diagnostics and
+        never changes which action is selected.
+        """
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = agent.compute_flow_actions(
+            candidate_observations, noises
+        )
+        candidate_actions = jnp.clip(candidate_actions, -1, 1)
+
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        predicted_latents, _ = world_model.network(
+            candidate_observations,
+            action_chunks,
+            candidate_observations,
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        progress_logits = self.network(predicted_latents)
+        progress_probabilities = jax.nn.softmax(progress_logits, axis=-1)
+        progress_values = jnp.arange(
+            self.num_classes, dtype=progress_logits.dtype
+        )
+        progress_scores = jnp.sum(
+            progress_probabilities * progress_values, axis=-1
+        )
+
+        current_latents = world_model.network(
+            observations, method="encode"
+        )
+        current_latents = jax.lax.stop_gradient(current_latents)
+        current_probabilities = jax.nn.softmax(
+            self.network(current_latents), axis=-1
+        )
+        current_scores = jnp.sum(
+            current_probabilities * progress_values, axis=-1
+        )
+
+        critic_ranks = jnp.argsort(
+            jnp.argsort(critic_scores, axis=-1), axis=-1
+        ).astype(progress_scores.dtype)
+        progress_ranks = jnp.argsort(
+            jnp.argsort(progress_scores, axis=-1), axis=-1
+        ).astype(progress_scores.dtype)
+
+        def mean_correlation(left, right):
+            left = left - left.mean(axis=-1, keepdims=True)
+            right = right - right.mean(axis=-1, keepdims=True)
+            numerator = jnp.sum(left * right, axis=-1)
+            denominator = jnp.sqrt(
+                jnp.sum(jnp.square(left), axis=-1)
+                * jnp.sum(jnp.square(right), axis=-1)
+            ).clip(1e-8)
+            return jnp.mean(numerator / denominator)
+
+        critic_top1 = jnp.argmax(critic_scores, axis=-1)
+        progress_top1 = jnp.argmax(progress_scores, axis=-1)
+        topk = max(1, num_samples // 10)
+        _, critic_topk = jax.lax.top_k(critic_scores, topk)
+        _, progress_topk = jax.lax.top_k(progress_scores, topk)
+        topk_overlap = jnp.mean(
+            jax.vmap(
+                lambda left, right: jnp.mean(
+                    jnp.any(
+                        left[:, None] == right[None, :], axis=-1
+                    ).astype(progress_scores.dtype)
+                )
+            )(critic_topk, progress_topk)
+        )
+
+        critic_choice_progress_rank = jnp.take_along_axis(
+            progress_ranks, critic_top1[..., None], axis=-1
+        ).squeeze(-1)
+        progress_choice_critic_rank = jnp.take_along_axis(
+            critic_ranks, progress_top1[..., None], axis=-1
+        ).squeeze(-1)
+        rank_denominator = jnp.asarray(
+            max(1, num_samples - 1), dtype=progress_scores.dtype
+        )
+        critic_actions = jnp.take_along_axis(
+            candidate_actions,
+            critic_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        progress_actions = jnp.take_along_axis(
+            candidate_actions,
+            progress_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        score_deltas = progress_scores - current_scores[..., None]
+        probability_entropy = -jnp.sum(
+            progress_probabilities
+            * jnp.log(progress_probabilities.clip(1e-8)),
+            axis=-1,
+        )
+
+        return {
+            "spearman_correlation": mean_correlation(
+                critic_ranks, progress_ranks
+            ),
+            "score_correlation": mean_correlation(
+                critic_scores, progress_scores
+            ),
+            "top1_agreement": jnp.mean(
+                (critic_top1 == progress_top1).astype(
+                    progress_scores.dtype
+                )
+            ),
+            "topk_overlap": topk_overlap,
+            "random_top1_agreement": jnp.asarray(
+                1.0 / num_samples, dtype=progress_scores.dtype
+            ),
+            "random_topk_overlap": jnp.asarray(
+                topk / num_samples, dtype=progress_scores.dtype
+            ),
+            "critic_choice_progress_percentile": jnp.mean(
+                critic_choice_progress_rank / rank_denominator
+            ),
+            "progress_choice_critic_percentile": jnp.mean(
+                progress_choice_critic_rank / rank_denominator
+            ),
+            "selected_action_l2": jnp.mean(
+                jnp.linalg.norm(
+                    critic_actions - progress_actions, axis=-1
+                )
+            ),
+            "critic_score_std": jnp.mean(
+                jnp.std(critic_scores, axis=-1)
+            ),
+            "progress_score_std": jnp.mean(
+                jnp.std(progress_scores, axis=-1)
+            ),
+            "current_progress_mean": jnp.mean(current_scores),
+            "candidate_progress_mean": jnp.mean(progress_scores),
+            "candidate_progress_delta_mean": jnp.mean(score_deltas),
+            "candidate_progress_delta_std": jnp.std(score_deltas),
+            "candidate_progress_max_delta_mean": jnp.mean(
+                jnp.max(score_deltas, axis=-1)
+            ),
+            "candidate_probability_entropy": jnp.mean(
+                probability_entropy
+            ),
+            "candidate_max_probability": jnp.mean(
+                jnp.max(progress_probabilities, axis=-1)
+            ),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(critic_scores)),
+                jnp.logical_and(
+                    jnp.all(jnp.isfinite(progress_scores)),
+                    jnp.all(jnp.isfinite(progress_probabilities)),
+                ),
+            ),
+        }
