@@ -392,3 +392,138 @@ class LatentValueTrainState(flax.struct.PyTreeNode):
             self.network.params,
         )
         return info
+
+    @jax.jit
+    def evaluate_candidates(self, observations, world_model, agent, rng):
+        """Compare critic and latent-value rankings on identical candidates.
+
+        This is a read-only diagnostic. It reproduces best-of-N candidate
+        generation but does not return an action or affect action selection.
+        """
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = agent.compute_flow_actions(
+            candidate_observations, noises
+        )
+        candidate_actions = jnp.clip(candidate_actions, -1, 1)
+
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        predicted_latents, _ = world_model.network(
+            candidate_observations,
+            action_chunks,
+            candidate_observations,
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        value_scores = self.network(predicted_latents)
+
+        critic_ranks = jnp.argsort(
+            jnp.argsort(critic_scores, axis=-1), axis=-1
+        ).astype(value_scores.dtype)
+        value_ranks = jnp.argsort(
+            jnp.argsort(value_scores, axis=-1), axis=-1
+        ).astype(value_scores.dtype)
+
+        def mean_correlation(left, right):
+            left = left - left.mean(axis=-1, keepdims=True)
+            right = right - right.mean(axis=-1, keepdims=True)
+            numerator = jnp.sum(left * right, axis=-1)
+            denominator = jnp.sqrt(
+                jnp.sum(jnp.square(left), axis=-1)
+                * jnp.sum(jnp.square(right), axis=-1)
+            ).clip(1e-8)
+            return jnp.mean(numerator / denominator)
+
+        critic_top1 = jnp.argmax(critic_scores, axis=-1)
+        value_top1 = jnp.argmax(value_scores, axis=-1)
+        top1_agreement = jnp.mean(
+            (critic_top1 == value_top1).astype(value_scores.dtype)
+        )
+
+        topk = max(1, num_samples // 10)
+        _, critic_topk = jax.lax.top_k(critic_scores, topk)
+        _, value_topk = jax.lax.top_k(value_scores, topk)
+        topk_overlap = jnp.mean(
+            jax.vmap(
+                lambda left, right: jnp.mean(
+                    jnp.any(left[:, None] == right[None, :], axis=-1).astype(
+                        value_scores.dtype
+                    )
+                )
+            )(critic_topk, value_topk)
+        )
+
+        critic_choice_value_rank = jnp.take_along_axis(
+            value_ranks, critic_top1[..., None], axis=-1
+        ).squeeze(-1)
+        value_choice_critic_rank = jnp.take_along_axis(
+            critic_ranks, value_top1[..., None], axis=-1
+        ).squeeze(-1)
+        rank_denominator = jnp.asarray(
+            max(1, num_samples - 1), dtype=value_scores.dtype
+        )
+
+        critic_selected_actions = jnp.take_along_axis(
+            candidate_actions,
+            critic_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        value_selected_actions = jnp.take_along_axis(
+            candidate_actions,
+            value_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+
+        return {
+            "spearman_correlation": mean_correlation(
+                critic_ranks, value_ranks
+            ),
+            "score_correlation": mean_correlation(
+                critic_scores, value_scores
+            ),
+            "top1_agreement": top1_agreement,
+            "topk_overlap": topk_overlap,
+            "random_top1_agreement": jnp.asarray(
+                1.0 / num_samples, dtype=value_scores.dtype
+            ),
+            "random_topk_overlap": jnp.asarray(
+                topk / num_samples, dtype=value_scores.dtype
+            ),
+            "critic_choice_value_percentile": jnp.mean(
+                critic_choice_value_rank / rank_denominator
+            ),
+            "value_choice_critic_percentile": jnp.mean(
+                value_choice_critic_rank / rank_denominator
+            ),
+            "selected_action_l2": jnp.mean(
+                jnp.linalg.norm(
+                    critic_selected_actions - value_selected_actions,
+                    axis=-1,
+                )
+            ),
+            "critic_score_std": jnp.mean(jnp.std(critic_scores, axis=-1)),
+            "value_score_std": jnp.mean(jnp.std(value_scores, axis=-1)),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(critic_scores)),
+                jnp.all(jnp.isfinite(value_scores)),
+            ),
+        }

@@ -94,6 +94,28 @@ def main():
     assert 0.0 <= float(eval_info["pairwise_agreement"]) <= 1.0
     assert 0.0 <= float(eval_info["topk_agreement"]) <= 1.0
 
+    candidate_info = value_state.evaluate_candidates(
+        observations,
+        world_model,
+        agent,
+        jax.random.PRNGKey(3),
+    )
+    assert bool(candidate_info["is_finite"])
+    assert -1.0 <= float(candidate_info["spearman_correlation"]) <= 1.0
+    assert -1.0 <= float(candidate_info["score_correlation"]) <= 1.0
+    assert 0.0 <= float(candidate_info["top1_agreement"]) <= 1.0
+    assert 0.0 <= float(candidate_info["topk_overlap"]) <= 1.0
+    assert (
+        0.0
+        <= float(candidate_info["critic_choice_value_percentile"])
+        <= 1.0
+    )
+    assert (
+        0.0
+        <= float(candidate_info["value_choice_critic_percentile"])
+        <= 1.0
+    )
+
     utd_batch = jax.tree_util.tree_map(
         lambda value: jnp.stack((value, value), axis=0),
         batch,
@@ -114,6 +136,14 @@ def main():
         f"{float(eval_info['pairwise_agreement']):.6f}"
     )
     print(f"topk_agreement: {float(eval_info['topk_agreement']):.6f}")
+    print(
+        "candidate_spearman: "
+        f"{float(candidate_info['spearman_correlation']):.6f}"
+    )
+    print(
+        "candidate_top1_agreement: "
+        f"{float(candidate_info['top1_agreement']):.6f}"
+    )
 
 
 if __name__ == "__main__":

@@ -42,6 +42,16 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_file', None, 'Checkpoint file to restore before training.')
 flags.DEFINE_integer('restore_step', 0, 'Global step represented by the restored checkpoint.')
 flags.DEFINE_bool('eval_only', False, 'Only evaluate the restored checkpoint and exit.')
+flags.DEFINE_bool(
+    'candidate_diagnostic_only',
+    False,
+    'Only compare critic and latent-value rankings on best-of-N candidates.',
+)
+flags.DEFINE_integer(
+    'candidate_diagnostic_batches',
+    16,
+    'Number of held-out batches used by candidate_diagnostic_only.',
+)
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
@@ -248,6 +258,8 @@ def main(_):
 
     # Setup logging.
     prefixes = ["eval", "env"]
+    if FLAGS.candidate_diagnostic_only:
+        prefixes.append("candidate_diagnostic")
     if FLAGS.offline_steps > 0:
         prefixes.append("offline_agent")
     if FLAGS.online_steps > 0:
@@ -287,6 +299,86 @@ def main(_):
         for csv_logger in logger.csv_loggers.values():
             csv_logger.close()
 
+        wandb.finish()
+        return
+
+    if FLAGS.candidate_diagnostic_only:
+        if FLAGS.restore_file is None:
+            raise ValueError(
+                "--candidate_diagnostic_only requires --restore_file"
+            )
+        if world_model is None or world_model_value is None:
+            raise ValueError(
+                "--candidate_diagnostic_only requires wm_enabled=True and "
+                "wm_value_enabled=True"
+            )
+        if config["actor_type"] != "best-of-n":
+            raise ValueError(
+                "--candidate_diagnostic_only requires actor_type=best-of-n"
+            )
+        if not config["action_chunking"]:
+            raise ValueError(
+                "--candidate_diagnostic_only requires action_chunking=True"
+            )
+        if FLAGS.candidate_diagnostic_batches <= 0:
+            raise ValueError("--candidate_diagnostic_batches must be positive")
+
+        diagnostic_dataset = Dataset.create(**val_dataset)
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 20_000)
+        diagnostic_rng = jax.random.PRNGKey(FLAGS.seed + 20_000)
+        candidate_infos = []
+        try:
+            for _ in range(FLAGS.candidate_diagnostic_batches):
+                diagnostic_batch = diagnostic_dataset.sample(
+                    config["batch_size"]
+                )
+                diagnostic_rng, candidate_rng = jax.random.split(
+                    diagnostic_rng
+                )
+                candidate_infos.append(
+                    world_model_value.evaluate_candidates(
+                        diagnostic_batch["observations"],
+                        world_model,
+                        agent,
+                        candidate_rng,
+                    )
+                )
+        finally:
+            np.random.set_state(numpy_rng_state)
+
+        candidate_info = jax.tree_util.tree_map(
+            lambda *values: np.mean(np.asarray(values), axis=0),
+            *candidate_infos,
+        )
+        candidate_batch_std = jax.tree_util.tree_map(
+            lambda *values: np.std(np.asarray(values), axis=0),
+            *candidate_infos,
+        )
+        for key in (
+            "spearman_correlation",
+            "score_correlation",
+            "top1_agreement",
+            "topk_overlap",
+            "critic_choice_value_percentile",
+            "value_choice_critic_percentile",
+        ):
+            candidate_info[f"{key}_batch_std"] = candidate_batch_std[key]
+
+        print("Read-only candidate ranking diagnostic:", flush=True)
+        for key in sorted(candidate_info):
+            print(
+                f"  {key}: {float(candidate_info[key]):.6f}",
+                flush=True,
+            )
+        logger.log(
+            dict(candidate_info),
+            "candidate_diagnostic",
+            step=log_step,
+        )
+
+        for csv_logger in logger.csv_loggers.values():
+            csv_logger.close()
         wandb.finish()
         return
 
