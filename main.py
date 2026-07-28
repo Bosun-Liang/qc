@@ -94,6 +94,27 @@ flags.DEFINE_float(
     0.0,
     "Potential-delta coefficient used when wm_delta_score_eval_enabled is true.",
 )
+flags.DEFINE_bool(
+    "wm_delta_veto_eval_enabled",
+    False,
+    "Filter predicted negative-delta candidates in eval-only mode.",
+)
+flags.DEFINE_float(
+    "wm_delta_veto_threshold",
+    -0.01,
+    "Minimum predicted potential delta for an eval-only candidate to be safe.",
+)
+flags.DEFINE_integer(
+    "wm_delta_veto_min_candidates",
+    1,
+    "Minimum safe candidates required before applying the veto.",
+)
+flags.DEFINE_enum(
+    "wm_delta_veto_fallback",
+    "critic",
+    ["critic"],
+    "Fallback selection when too few candidates pass the veto.",
+)
 flags.DEFINE_integer(
     "eval_seed",
     None,
@@ -159,13 +180,21 @@ def main(_):
         raise ValueError(
             "--wm_delta_score_eval_enabled is restricted to --eval_only=True"
         )
-    if (
-        FLAGS.wm_score_eval_enabled
-        and FLAGS.wm_delta_score_eval_enabled
-    ):
+    if FLAGS.wm_delta_veto_eval_enabled and not FLAGS.eval_only:
         raise ValueError(
-            "--wm_score_eval_enabled and --wm_delta_score_eval_enabled are "
-            "mutually exclusive"
+            "--wm_delta_veto_eval_enabled is restricted to --eval_only=True"
+        )
+    wm_eval_modes = sum(
+        (
+            FLAGS.wm_score_eval_enabled,
+            FLAGS.wm_delta_score_eval_enabled,
+            FLAGS.wm_delta_veto_eval_enabled,
+        )
+    )
+    if wm_eval_modes > 1:
+        raise ValueError(
+            "World-model evaluation action-selection modes are mutually "
+            "exclusive"
         )
     diagnostic_only_count = sum(
         (
@@ -810,6 +839,50 @@ def main(_):
                 flush=True,
             )
 
+        elif FLAGS.wm_delta_veto_eval_enabled:
+            if world_model is None or world_model_delta is None:
+                raise ValueError(
+                    "--wm_delta_veto_eval_enabled requires wm_enabled=True "
+                    "and wm_delta_enabled=True"
+                )
+            if config["actor_type"] != "best-of-n":
+                raise ValueError(
+                    "--wm_delta_veto_eval_enabled requires "
+                    "actor_type=best-of-n"
+                )
+            if not config["action_chunking"]:
+                raise ValueError(
+                    "--wm_delta_veto_eval_enabled requires "
+                    "action_chunking=True"
+                )
+            if not np.isfinite(FLAGS.wm_delta_veto_threshold):
+                raise ValueError(
+                    "--wm_delta_veto_threshold must be finite"
+                )
+            if not (
+                1
+                <= FLAGS.wm_delta_veto_min_candidates
+                <= config["actor_num_samples"]
+            ):
+                raise ValueError(
+                    "--wm_delta_veto_min_candidates must be between 1 and "
+                    "actor_num_samples"
+                )
+            sample_actions_fn = functools.partial(
+                world_model_delta.sample_actions_with_veto,
+                world_model=world_model,
+                agent=agent,
+                threshold=FLAGS.wm_delta_veto_threshold,
+                min_candidates=FLAGS.wm_delta_veto_min_candidates,
+            )
+            print(
+                "Evaluation-only world-model negative-delta veto enabled "
+                f"with threshold={FLAGS.wm_delta_veto_threshold}, "
+                f"min_candidates={FLAGS.wm_delta_veto_min_candidates}, "
+                f"fallback={FLAGS.wm_delta_veto_fallback}.",
+                flush=True,
+            )
+
         eval_info, eval_trajs, renders = evaluate(
             agent=agent,
             env=eval_env,
@@ -1130,6 +1203,18 @@ def main(_):
             if key.startswith("lambda_")
             and key.rsplit("/", 1)[-1]
             in ("change_rate", "critic_percentile", "value_percentile")
+        )
+        batch_std_keys.extend(
+            key
+            for key in candidate_info
+            if key.startswith("wm_delta_veto/")
+            and key.rsplit("/", 1)[-1]
+            in (
+                "rejected_fraction",
+                "action_changed_fraction",
+                "chosen_critic_percentile",
+                "baseline_rejected_fraction",
+            )
         )
         for key in batch_std_keys:
             candidate_info[f"{key}_batch_std"] = candidate_batch_std[key]

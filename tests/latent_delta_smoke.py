@@ -158,6 +158,45 @@ def main():
     assert bool(jnp.array_equal(baseline_actions, zero_lambda_actions))
     assert baseline_actions.shape == mixed_actions.shape
     assert bool(jnp.all(jnp.isfinite(mixed_actions)))
+    for label in ("m002", "m001", "zero"):
+        prefix = f"wm_delta_veto/{label}"
+        assert 0.0 <= float(
+            candidate_info[f"{prefix}/rejected_fraction"]
+        ) <= 1.0
+        assert 0.0 <= float(
+            candidate_info[f"{prefix}/action_changed_fraction"]
+        ) <= 1.0
+        assert 0.0 <= float(
+            candidate_info[f"{prefix}/chosen_critic_percentile"]
+        ) <= 1.0
+    no_rejection_actions = delta.sample_actions_with_veto(
+        observations,
+        world_model,
+        agent,
+        selection_rng,
+        threshold=-1e6,
+        min_candidates=1,
+    )
+    fallback_actions = delta.sample_actions_with_veto(
+        observations,
+        world_model,
+        agent,
+        selection_rng,
+        threshold=1e6,
+        min_candidates=1,
+    )
+    veto_actions = delta.sample_actions_with_veto(
+        observations,
+        world_model,
+        agent,
+        selection_rng,
+        threshold=-0.01,
+        min_candidates=1,
+    )
+    assert bool(jnp.array_equal(baseline_actions, no_rejection_actions))
+    assert bool(jnp.array_equal(baseline_actions, fallback_actions))
+    assert baseline_actions.shape == veto_actions.shape
+    assert bool(jnp.all(jnp.isfinite(veto_actions)))
     assert all(
         bool(jnp.array_equal(before, after))
         for before, after in zip(

@@ -1902,7 +1902,7 @@ class LatentPotentialDeltaTrainState(flax.struct.PyTreeNode):
         threshold = jnp.asarray(
             self.nontrivial_threshold, dtype=delta_scores.dtype
         )
-        return {
+        info = {
             "spearman_correlation": mean_correlation(
                 critic_ranks, delta_ranks
             ),
@@ -1955,7 +1955,60 @@ class LatentPotentialDeltaTrainState(flax.struct.PyTreeNode):
                 jnp.all(jnp.isfinite(delta_scores)),
             ),
         }
-
+        for label, veto_threshold in (
+            ("m002", -0.02),
+            ("m001", -0.01),
+            ("zero", 0.0),
+        ):
+            safe = delta_scores >= veto_threshold
+            safe_count = jnp.sum(safe, axis=-1)
+            enough_safe = safe_count >= 1
+            safe_top1 = jnp.argmax(
+                jnp.where(safe, critic_scores, -jnp.inf), axis=-1
+            )
+            chosen = jnp.where(enough_safe, safe_top1, critic_top1)
+            chosen_delta = jnp.take_along_axis(
+                delta_scores, chosen[..., None], axis=-1
+            ).squeeze(-1)
+            baseline_delta = jnp.take_along_axis(
+                delta_scores, critic_top1[..., None], axis=-1
+            ).squeeze(-1)
+            chosen_critic_rank = jnp.take_along_axis(
+                critic_ranks, chosen[..., None], axis=-1
+            ).squeeze(-1)
+            prefix = f"wm_delta_veto/{label}"
+            info.update(
+                {
+                    f"{prefix}/threshold": jnp.asarray(
+                        veto_threshold, dtype=delta_scores.dtype
+                    ),
+                    f"{prefix}/rejected_fraction": jnp.mean(
+                        (~safe).astype(delta_scores.dtype)
+                    ),
+                    f"{prefix}/states_with_rejection": jnp.mean(
+                        jnp.any(~safe, axis=-1).astype(delta_scores.dtype)
+                    ),
+                    f"{prefix}/all_rejected_fraction": jnp.mean(
+                        (safe_count == 0).astype(delta_scores.dtype)
+                    ),
+                    f"{prefix}/chosen_delta": jnp.mean(chosen_delta),
+                    f"{prefix}/baseline_chosen_delta": jnp.mean(
+                        baseline_delta
+                    ),
+                    f"{prefix}/baseline_rejected_fraction": jnp.mean(
+                        (baseline_delta < veto_threshold).astype(
+                            delta_scores.dtype
+                        )
+                    ),
+                    f"{prefix}/action_changed_fraction": jnp.mean(
+                        (chosen != critic_top1).astype(delta_scores.dtype)
+                    ),
+                    f"{prefix}/chosen_critic_percentile": jnp.mean(
+                        chosen_critic_rank / rank_denominator
+                    ),
+                }
+            )
+        return info
 
     @jax.jit
     def sample_actions(
@@ -2030,6 +2083,78 @@ class LatentPotentialDeltaTrainState(flax.struct.PyTreeNode):
             lambda: mixed_scores,
         )
         indices = jnp.argmax(selection_scores, axis=-1)
+
+        batch_shape = indices.shape
+        flat_indices = indices.reshape(-1)
+        batch_size = len(flat_indices)
+        return candidate_actions.reshape(
+            (-1, num_samples, flat_action_dim)
+        )[jnp.arange(batch_size), flat_indices, :].reshape(
+            batch_shape + (flat_action_dim,)
+        )
+
+
+    @jax.jit
+    def sample_actions_with_veto(
+        self,
+        observations,
+        world_model,
+        agent,
+        rng,
+        threshold=-0.01,
+        min_candidates=1,
+    ):
+        """Keep critic ranking while filtering predicted negative deltas."""
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = jnp.clip(
+            agent.compute_flow_actions(candidate_observations, noises),
+            -1,
+            1,
+        )
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        latents = world_model.network(
+            candidate_observations, method="encode"
+        )
+        predicted_latents = world_model.network(
+            candidate_observations,
+            action_chunks,
+            method="predict",
+        )
+        normalized_delta_scores = self.network(
+            latents, predicted_latents, action_chunks
+        )
+        delta_scores = (
+            normalized_delta_scores * self.target_std + self.target_mean
+        )
+        safe = delta_scores >= threshold
+        safe_count = jnp.sum(safe, axis=-1)
+        safe_top1 = jnp.argmax(
+            jnp.where(safe, critic_scores, -jnp.inf), axis=-1
+        )
+        critic_top1 = jnp.argmax(critic_scores, axis=-1)
+        indices = jnp.where(
+            safe_count >= min_candidates, safe_top1, critic_top1
+        )
 
         batch_shape = indices.shape
         flat_indices = indices.reshape(-1)
