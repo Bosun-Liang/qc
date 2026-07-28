@@ -355,6 +355,13 @@ def get_config():
             wm_progress_lr=3e-4,
             wm_progress_num_classes=4,
             wm_progress_validation_per_class=256,
+            wm_potential_enabled=False,
+            wm_potential_coef=1.0,
+            wm_potential_hidden_dims=(256, 256),
+            wm_potential_lr=3e-4,
+            wm_potential_temperature=0.04,
+            wm_potential_num_bins=8,
+            wm_potential_validation_per_bin=256,
         )
     )
     return config

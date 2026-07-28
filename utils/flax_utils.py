@@ -166,6 +166,7 @@ def save_agent(
     world_model=None,
     world_model_value=None,
     world_model_progress=None,
+    world_model_potential=None,
 ):
     """Save the agent to a file.
 
@@ -188,6 +189,10 @@ def save_agent(
         save_dict['world_model_progress'] = flax.serialization.to_state_dict(
             world_model_progress
         )
+    if world_model_potential is not None:
+        save_dict['world_model_potential'] = flax.serialization.to_state_dict(
+            world_model_potential
+        )
     save_path = os.path.join(save_dir, f'params_{epoch}.pkl')
     with open(save_path, 'wb') as f:
         pickle.dump(save_dict, f)
@@ -201,6 +206,7 @@ def restore_agent_with_file(
     world_model=None,
     world_model_value=None,
     world_model_progress=None,
+    world_model_potential=None,
 ):
     """Just like restore_agent() but expect file_path to include restore_epoch
     """
@@ -254,6 +260,20 @@ def restore_agent_with_file(
                 'initialized diagnostic progress-head parameters.'
             )
         restored_states.append(world_model_progress)
+
+    if world_model_potential is not None:
+        if 'world_model_potential' in load_dict:
+            world_model_potential = flax.serialization.from_state_dict(
+                world_model_potential,
+                load_dict['world_model_potential'],
+            )
+            print(f'Restored world model potential head from {file_path}')
+        else:
+            print(
+                'Checkpoint has no world_model_potential state; using newly '
+                'initialized diagnostic potential-head parameters.'
+            )
+        restored_states.append(world_model_potential)
 
     if len(restored_states) > 1:
         return tuple(restored_states)

@@ -28,6 +28,7 @@ from utils.datasets import Dataset, ReplayBuffer
 from evaluation import evaluate, flatten
 from agents import agents
 from agents.world_model import (
+    LatentPotentialTrainState,
     LatentProgressTrainState,
     LatentValueTrainState,
     WorldModelTrainState,
@@ -61,6 +62,11 @@ flags.DEFINE_bool(
     'wm_progress_only',
     False,
     'Freeze agent/world-model states and train only the progress head.',
+)
+flags.DEFINE_bool(
+    'wm_potential_only',
+    False,
+    'Freeze agent/world-model states and train only the potential head.',
 )
 flags.DEFINE_bool(
     'wm_score_eval_enabled',
@@ -133,6 +139,10 @@ def main(_):
         raise ValueError(
             "--wm_score_eval_enabled is restricted to --eval_only=True"
         )
+    if FLAGS.wm_progress_only and FLAGS.wm_potential_only:
+        raise ValueError(
+            "--wm_progress_only and --wm_potential_only are mutually exclusive"
+        )
     if FLAGS.wm_progress_only:
         if FLAGS.restore_file is None:
             raise ValueError("--wm_progress_only requires --restore_file")
@@ -141,6 +151,24 @@ def main(_):
         if not config.get('wm_progress_enabled', False):
             raise ValueError(
                 "--wm_progress_only requires wm_progress_enabled=True"
+            )
+    if FLAGS.wm_potential_only:
+        if FLAGS.restore_file is None:
+            raise ValueError("--wm_potential_only requires --restore_file")
+        if FLAGS.online_steps != 0:
+            raise ValueError("--wm_potential_only requires --online_steps=0")
+        if not config.get('wm_potential_enabled', False):
+            raise ValueError(
+                "--wm_potential_only requires wm_potential_enabled=True"
+            )
+    if config.get('wm_potential_enabled', False):
+        if FLAGS.ogbench_dataset_dir is None or 'cube' not in FLAGS.env_name:
+            raise ValueError(
+                "wm_potential_enabled currently supports only OGBench cube tasks"
+            )
+        if FLAGS.online_steps != 0:
+            raise ValueError(
+                "wm_potential_enabled is currently restricted to online_steps=0"
             )
     
     # data loading
@@ -181,6 +209,7 @@ def main(_):
             FLAGS.env_name,
             dataset_path=dataset_paths[dataset_idx],
             compact_dataset=False,
+            add_info=config.get('wm_potential_enabled', False),
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
@@ -196,15 +225,55 @@ def main(_):
     config["horizon_length"] = FLAGS.horizon_length
 
     # handle dataset
+    potential_target_cube_xyzs = None
+    if config.get('wm_potential_enabled', False):
+        num_cubes = env.unwrapped._num_cubes
+        potential_target_cube_xyzs = (
+            env.unwrapped._data.mocap_pos.copy()[:num_cubes]
+        )
+        if config['wm_potential_temperature'] <= 0:
+            raise ValueError('wm_potential_temperature must be positive')
+
+    def add_cube_potential_labels(ds):
+        """Attach smooth cube-success labels and remove privileged fields."""
+        if potential_target_cube_xyzs is None:
+            return ds
+        if 'qpos' not in ds:
+            raise ValueError('Cube potential labels require dataset qpos')
+        fields = {key: value for key, value in ds.items()}
+        qpos = np.asarray(fields['qpos'])
+        cube_xyzs = np.stack(
+            [
+                qpos[:, 14 + 7 * index : 17 + 7 * index]
+                for index in range(len(potential_target_cube_xyzs))
+            ],
+            axis=1,
+        )
+        distances = np.linalg.norm(
+            cube_xyzs - potential_target_cube_xyzs[None], axis=-1
+        )
+        scaled_distances = (
+            distances - 0.04
+        ) / config['wm_potential_temperature']
+        smooth_successes = 1.0 / (
+            1.0 + np.exp(np.clip(scaled_distances, -60.0, 60.0))
+        )
+        fields['wm_potentials'] = smooth_successes.sum(
+            axis=-1
+        ).astype(np.float32)
+        for key in ('qpos', 'qvel', 'button_states'):
+            fields.pop(key, None)
+        return fields
+
     def process_train_dataset(ds):
         """
-        Process the train dataset to 
+        Process the train dataset to
+            - attach optional diagnostic potential labels
             - handle dataset proportion
             - handle sparse reward
-            - convert to action chunked dataset
         """
 
-        ds = Dataset.create(**ds)
+        ds = Dataset.create(**add_cube_potential_labels(ds))
         if FLAGS.dataset_proportion < 1.0:
             new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
             ds = Dataset.create(
@@ -240,7 +309,9 @@ def main(_):
     world_model = None
     world_model_value = None
     world_model_progress = None
+    world_model_potential = None
     progress_train_class_indices = None
+    potential_train_bin_indices = None
     if config.get('wm_enabled', False):
         world_model = WorldModelTrainState.create(
             seed=FLAGS.seed + 1,
@@ -316,6 +387,50 @@ def main(_):
             f'{progress_sampling}.',
             flush=True,
         )
+    if config.get('wm_potential_enabled', False):
+        if world_model is None:
+            raise ValueError('wm_potential_enabled requires wm_enabled=True')
+        potential_values = np.asarray(
+            train_dataset['wm_potentials']
+        ).reshape(-1)
+        potential_target_mean = float(potential_values.mean())
+        potential_target_std = float(potential_values.std())
+        if potential_target_std <= 0:
+            raise ValueError('Potential labels have zero variance')
+        potential_edges = np.quantile(
+            potential_values,
+            np.linspace(0.0, 1.0, config['wm_potential_num_bins'] + 1),
+        )
+        potential_internal_edges = np.unique(potential_edges[1:-1])
+        potential_bin_ids = np.digitize(
+            potential_values, potential_internal_edges
+        )
+        potential_train_bin_indices = [
+            np.flatnonzero(potential_bin_ids == bin_index)
+            for bin_index in range(len(potential_internal_edges) + 1)
+            if np.any(potential_bin_ids == bin_index)
+        ]
+        potential_bin_counts = [
+            len(indices) for indices in potential_train_bin_indices
+        ]
+        world_model_potential = LatentPotentialTrainState.create(
+            seed=FLAGS.seed + 4,
+            latent_dim=config['wm_latent_dim'],
+            hidden_dims=config['wm_potential_hidden_dims'],
+            learning_rate=config['wm_potential_lr'],
+            coef=config['wm_potential_coef'],
+            target_mean=potential_target_mean,
+            target_std=potential_target_std,
+        )
+        print(
+            'Initialized diagnostic latent potential head with '
+            f'range [{potential_values.min():.6f}, '
+            f'{potential_values.max():.6f}], mean '
+            f'{potential_target_mean:.6f}, std '
+            f'{potential_target_std:.6f}, and quantile-bin counts '
+            f'{potential_bin_counts}.',
+            flush=True,
+        )
 
     value_validation_batch = None
     if world_model_value is not None:
@@ -368,6 +483,51 @@ def main(_):
         )
         np.random.set_state(numpy_rng_state)
 
+    potential_validation_batch = None
+    if world_model_potential is not None:
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 40_000)
+        potential_validation_dataset = Dataset.create(
+            **add_cube_potential_labels(val_dataset)
+        )
+        validation_potentials = np.asarray(
+            potential_validation_dataset['wm_potentials']
+        ).reshape(-1)
+        validation_edges = np.quantile(
+            validation_potentials,
+            np.linspace(0.0, 1.0, config['wm_potential_num_bins'] + 1),
+        )
+        validation_internal_edges = np.unique(validation_edges[1:-1])
+        validation_bin_ids = np.digitize(
+            validation_potentials, validation_internal_edges
+        )
+        potential_validation_indices = []
+        for bin_index in range(len(validation_internal_edges) + 1):
+            bin_indices = np.flatnonzero(
+                validation_bin_ids == bin_index
+            )
+            if len(bin_indices) == 0:
+                continue
+            potential_validation_indices.append(
+                np.random.choice(
+                    bin_indices,
+                    size=config['wm_potential_validation_per_bin'],
+                    replace=(
+                        len(bin_indices)
+                        < config['wm_potential_validation_per_bin']
+                    ),
+                )
+            )
+        potential_validation_indices = np.concatenate(
+            potential_validation_indices
+        )
+        np.random.shuffle(potential_validation_indices)
+        potential_validation_batch = potential_validation_dataset.sample(
+            len(potential_validation_indices),
+            idxs=potential_validation_indices,
+        )
+        np.random.set_state(numpy_rng_state)
+
     if FLAGS.restore_file is not None:
         restored = restore_agent_with_file(
             agent,
@@ -375,6 +535,7 @@ def main(_):
             world_model=world_model,
             world_model_value=world_model_value,
             world_model_progress=world_model_progress,
+            world_model_potential=world_model_potential,
         )
         restored_states = iter(
             restored if isinstance(restored, tuple) else (restored,)
@@ -386,6 +547,8 @@ def main(_):
             world_model_value = next(restored_states)
         if world_model_progress is not None:
             world_model_progress = next(restored_states)
+        if world_model_potential is not None:
+            world_model_potential = next(restored_states)
         print(
             f"Restored checkpoint from {FLAGS.restore_file} "
             f"at global step {FLAGS.restore_step}",
@@ -509,20 +672,19 @@ def main(_):
             raise ValueError(
                 "--candidate_diagnostic_only requires --restore_file"
             )
-        candidate_head = (
-            world_model_value
-            if world_model_value is not None
-            else world_model_progress
-        )
-        candidate_head_name = (
-            "latent value"
-            if world_model_value is not None
-            else "latent progress"
-        )
+        if world_model_value is not None:
+            candidate_head = world_model_value
+            candidate_head_name = "latent value"
+        elif world_model_progress is not None:
+            candidate_head = world_model_progress
+            candidate_head_name = "latent progress"
+        else:
+            candidate_head = world_model_potential
+            candidate_head_name = "latent potential"
         if world_model is None or candidate_head is None:
             raise ValueError(
                 "--candidate_diagnostic_only requires wm_enabled=True and "
-                "either wm_value_enabled=True or wm_progress_enabled=True"
+                "one diagnostic latent head enabled"
             )
         if config["actor_type"] != "best-of-n":
             raise ValueError(
@@ -535,7 +697,13 @@ def main(_):
         if FLAGS.candidate_diagnostic_batches <= 0:
             raise ValueError("--candidate_diagnostic_batches must be positive")
 
-        diagnostic_dataset = Dataset.create(**val_dataset)
+        diagnostic_dataset = Dataset.create(
+            **(
+                add_cube_potential_labels(val_dataset)
+                if candidate_head_name == "latent potential"
+                else val_dataset
+            )
+        )
         numpy_rng_state = np.random.get_state()
         np.random.seed(FLAGS.seed + 20_000)
         diagnostic_rng = jax.random.PRNGKey(FLAGS.seed + 20_000)
@@ -616,6 +784,86 @@ def main(_):
                 future_info = candidate_head.evaluate_predicted_future(
                     future_batch, world_model
                 )
+            elif candidate_head_name == "latent potential":
+                horizon_length = config["horizon_length"]
+                max_start = diagnostic_dataset.size - horizon_length
+                terminals = np.asarray(
+                    diagnostic_dataset["terminals"]
+                ).reshape(-1)
+                terminal_prefix = np.concatenate(
+                    ([0], np.cumsum(terminals > 0))
+                )
+                terminal_counts = (
+                    terminal_prefix[
+                        horizon_length:horizon_length + max_start
+                    ]
+                    - terminal_prefix[:max_start]
+                )
+                valid_starts = np.flatnonzero(terminal_counts == 0)
+                future_potentials = np.asarray(
+                    diagnostic_dataset["wm_potentials"]
+                ).reshape(-1)[valid_starts + horizon_length]
+                future_edges = np.quantile(
+                    future_potentials,
+                    np.linspace(
+                        0.0, 1.0, config["wm_potential_num_bins"] + 1
+                    ),
+                )
+                future_internal_edges = np.unique(future_edges[1:-1])
+                future_bin_ids = np.digitize(
+                    future_potentials, future_internal_edges
+                )
+                future_starts_by_bin = []
+                for bin_index in range(len(future_internal_edges) + 1):
+                    bin_starts = valid_starts[
+                        future_bin_ids == bin_index
+                    ]
+                    if len(bin_starts) == 0:
+                        continue
+                    future_starts_by_bin.append(
+                        np.random.choice(
+                            bin_starts,
+                            size=config[
+                                "wm_potential_validation_per_bin"
+                            ],
+                            replace=(
+                                len(bin_starts)
+                                < config[
+                                    "wm_potential_validation_per_bin"
+                                ]
+                            ),
+                        )
+                    )
+                if not future_starts_by_bin:
+                    raise ValueError(
+                        "No terminal-valid future potential samples found"
+                    )
+                future_starts = np.concatenate(future_starts_by_bin)
+                np.random.shuffle(future_starts)
+                action_indices = (
+                    future_starts[:, None]
+                    + np.arange(horizon_length)[None, :]
+                )
+                future_batch = {
+                    "observations": diagnostic_dataset["observations"][
+                        future_starts
+                    ],
+                    "actions": diagnostic_dataset["actions"][
+                        action_indices
+                    ],
+                    "target_observations": diagnostic_dataset[
+                        "next_observations"
+                    ][future_starts + horizon_length - 1],
+                    "target_potentials": diagnostic_dataset[
+                        "wm_potentials"
+                    ][future_starts + horizon_length],
+                    "current_potentials": diagnostic_dataset[
+                        "wm_potentials"
+                    ][future_starts],
+                }
+                future_info = candidate_head.evaluate_predicted_future(
+                    future_batch, world_model
+                )
 
             for _ in range(FLAGS.candidate_diagnostic_batches):
                 diagnostic_batch = diagnostic_dataset.sample(
@@ -661,6 +909,8 @@ def main(_):
                 "value_choice_critic_percentile",
                 "critic_choice_progress_percentile",
                 "progress_choice_critic_percentile",
+                "critic_choice_potential_percentile",
+                "potential_choice_critic_percentile",
             )
             if key in candidate_info
         ]
@@ -708,6 +958,7 @@ def main(_):
                 compact_dataset=False,
                 dataset_only=True,
                 cur_env=env,
+                add_info=config.get('wm_potential_enabled', False),
             )
             train_dataset = process_train_dataset(train_dataset)
             if FLAGS.wm_progress_only:
@@ -724,6 +975,29 @@ def main(_):
                         config['wm_progress_num_classes']
                     )
                     if np.any(replacement_labels == class_index)
+                ]
+            if FLAGS.wm_potential_only:
+                replacement_potentials = np.asarray(
+                    train_dataset['wm_potentials']
+                ).reshape(-1)
+                replacement_edges = np.quantile(
+                    replacement_potentials,
+                    np.linspace(
+                        0.0, 1.0, config['wm_potential_num_bins'] + 1
+                    ),
+                )
+                replacement_internal_edges = np.unique(
+                    replacement_edges[1:-1]
+                )
+                replacement_bin_ids = np.digitize(
+                    replacement_potentials, replacement_internal_edges
+                )
+                potential_train_bin_indices = [
+                    np.flatnonzero(replacement_bin_ids == bin_index)
+                    for bin_index in range(
+                        len(replacement_internal_edges) + 1
+                    )
+                    if np.any(replacement_bin_ids == bin_index)
                 ]
 
         if FLAGS.wm_progress_only:
@@ -751,6 +1025,31 @@ def main(_):
                 len(progress_batch_indices),
                 idxs=progress_batch_indices,
             )
+        elif FLAGS.wm_potential_only:
+            num_potential_bins = len(potential_train_bin_indices)
+            base_size, remainder = divmod(
+                config['batch_size'], num_potential_bins
+            )
+            potential_batch_indices = []
+            for position, bin_indices in enumerate(
+                potential_train_bin_indices
+            ):
+                bin_batch_size = base_size + (position < remainder)
+                potential_batch_indices.append(
+                    np.random.choice(
+                        bin_indices,
+                        size=bin_batch_size,
+                        replace=len(bin_indices) < bin_batch_size,
+                    )
+                )
+            potential_batch_indices = np.concatenate(
+                potential_batch_indices
+            )
+            np.random.shuffle(potential_batch_indices)
+            batch = train_dataset.sample(
+                len(potential_batch_indices),
+                idxs=potential_batch_indices,
+            )
         else:
             batch = train_dataset.sample_sequence(
                 config['batch_size'],
@@ -758,7 +1057,7 @@ def main(_):
                 discount=discount,
             )
 
-        if FLAGS.wm_progress_only:
+        if FLAGS.wm_progress_only or FLAGS.wm_potential_only:
             offline_info = {}
         else:
             agent, offline_info = agent.update(batch)
@@ -784,7 +1083,10 @@ def main(_):
                         for key, value in value_info.items()
                     },
                 }
-        if world_model_progress is not None:
+        if (
+            world_model_progress is not None
+            and not FLAGS.wm_potential_only
+        ):
             world_model_progress, progress_info = (
                 world_model_progress.update(batch, world_model)
             )
@@ -793,6 +1095,20 @@ def main(_):
                 **{
                     f'world_model_progress/{key}': value
                     for key, value in progress_info.items()
+                },
+            }
+        if (
+            world_model_potential is not None
+            and not FLAGS.wm_progress_only
+        ):
+            world_model_potential, potential_info = (
+                world_model_potential.update(batch, world_model)
+            )
+            offline_info = {
+                **offline_info,
+                **{
+                    f'world_model_potential/{key}': value
+                    for key, value in potential_info.items()
                 },
             }
 
@@ -821,6 +1137,17 @@ def main(_):
                         for key, value in progress_heldout_info.items()
                     },
                 }
+            if world_model_potential is not None:
+                potential_heldout_info = world_model_potential.evaluate(
+                    potential_validation_batch, world_model
+                )
+                offline_info = {
+                    **offline_info,
+                    **{
+                        f'world_model_potential/heldout_{key}': value
+                        for key, value in potential_heldout_info.items()
+                    },
+                }
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -832,6 +1159,7 @@ def main(_):
                 world_model=world_model,
                 world_model_value=world_model_value,
                 world_model_progress=world_model_progress,
+                world_model_potential=world_model_potential,
             )
 
         # eval
@@ -1047,6 +1375,7 @@ def main(_):
                 world_model=world_model,
                 world_model_value=world_model_value,
                 world_model_progress=world_model_progress,
+                world_model_potential=world_model_potential,
             )
 
     end_time = time.time()

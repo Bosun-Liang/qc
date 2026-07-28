@@ -73,6 +73,19 @@ class LatentProgressHead(nn.Module):
         )(latents)
 
 
+class LatentPotentialHead(nn.Module):
+    """Regress a continuous task potential from an observation latent."""
+
+    hidden_dims: Sequence[int]
+
+    @nn.compact
+    def __call__(self, latents):
+        return MLP(
+            (*self.hidden_dims, 1),
+            activate_final=False,
+        )(latents).squeeze(-1)
+
+
 class WorldModel(nn.Module):
     """Encode observations and predict the latent after an action chunk."""
 
@@ -1187,5 +1200,409 @@ class LatentProgressTrainState(flax.struct.PyTreeNode):
                     jnp.all(jnp.isfinite(progress_scores)),
                     jnp.all(jnp.isfinite(progress_probabilities)),
                 ),
+            ),
+        }
+
+
+class LatentPotentialTrainState(flax.struct.PyTreeNode):
+    """Independent diagnostic regressor for a continuous task potential."""
+
+    network: Any
+    coef: float = nonpytree_field()
+    target_mean: float = nonpytree_field()
+    target_std: float = nonpytree_field()
+
+    @classmethod
+    def create(
+        cls,
+        seed,
+        latent_dim=64,
+        hidden_dims=(256, 256),
+        learning_rate=3e-4,
+        coef=1.0,
+        target_mean=0.0,
+        target_std=1.0,
+    ):
+        if target_std <= 0:
+            raise ValueError("target_std must be positive")
+        model = LatentPotentialHead(hidden_dims=hidden_dims)
+        params = model.init(
+            jax.random.PRNGKey(seed),
+            jnp.zeros((latent_dim,), dtype=jnp.float32),
+        )["params"]
+        network = TrainState.create(
+            model_def=model,
+            params=params,
+            tx=optax.adam(learning_rate=learning_rate),
+        )
+        return cls(
+            network=network,
+            coef=coef,
+            target_mean=float(target_mean),
+            target_std=float(target_std),
+        )
+
+    def potential_loss(self, batch, world_model, params):
+        latents = world_model.network(
+            batch["observations"], method="encode"
+        )
+        latents = jax.lax.stop_gradient(latents)
+        normalized_predictions = self.network(latents, params=params)
+        targets = batch["wm_potentials"]
+        if targets.ndim > normalized_predictions.ndim:
+            targets = targets[..., 0]
+        targets = targets.astype(normalized_predictions.dtype)
+        target_mean = jnp.asarray(
+            self.target_mean, dtype=normalized_predictions.dtype
+        )
+        target_std = jnp.asarray(
+            self.target_std, dtype=normalized_predictions.dtype
+        )
+        normalized_targets = (targets - target_mean) / target_std
+        predictions = normalized_predictions * target_std + target_mean
+
+        if "valid" in batch:
+            valid = batch["valid"]
+            if valid.ndim > predictions.ndim:
+                valid = valid[..., 0]
+            valid = valid.astype(predictions.dtype)
+        else:
+            valid = jnp.ones(predictions.shape, dtype=predictions.dtype)
+        valid_count = jnp.maximum(
+            jnp.sum(valid), jnp.asarray(1.0, dtype=valid.dtype)
+        )
+        normalized_errors = normalized_predictions - normalized_targets
+        loss = jnp.sum(jnp.square(normalized_errors) * valid) / valid_count
+        errors = predictions - targets
+        mae = jnp.sum(jnp.abs(errors) * valid) / valid_count
+
+        prediction_mean = jnp.sum(predictions * valid) / valid_count
+        observed_target_mean = jnp.sum(targets * valid) / valid_count
+        centered_predictions = predictions - prediction_mean
+        centered_targets = targets - observed_target_mean
+        prediction_variance = jnp.sum(
+            jnp.square(centered_predictions) * valid
+        ) / valid_count
+        target_variance = jnp.sum(
+            jnp.square(centered_targets) * valid
+        ) / valid_count
+        covariance = jnp.sum(
+            centered_predictions * centered_targets * valid
+        ) / valid_count
+        correlation = covariance / jnp.sqrt(
+            prediction_variance * target_variance
+        ).clip(1e-8)
+        raw_mse = jnp.sum(jnp.square(errors) * valid) / valid_count
+        r2 = 1.0 - raw_mse / target_variance.clip(1e-8)
+
+        info = {
+            "loss": loss,
+            "mae": mae,
+            "correlation": correlation,
+            "r2": r2,
+            "prediction_mean": prediction_mean,
+            "prediction_std": jnp.sqrt(
+                jnp.maximum(prediction_variance, 0.0)
+            ),
+            "target_mean": observed_target_mean,
+            "target_std": jnp.sqrt(jnp.maximum(target_variance, 0.0)),
+            "valid_fraction": valid.mean(),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(predictions)),
+                jnp.all(
+                    jnp.isfinite(
+                        jnp.asarray((loss, mae, correlation, r2))
+                    )
+                ),
+            ),
+        }
+        return loss, info
+
+    @staticmethod
+    def _update(state, batch, world_model):
+        def loss_fn(params):
+            loss, info = state.potential_loss(
+                batch, world_model, params
+            )
+            weighted_loss = state.coef * loss
+            info["weighted_loss"] = weighted_loss
+            return weighted_loss, info
+
+        network, info = state.network.apply_loss_fn(loss_fn)
+        return state.replace(network=network), info
+
+    @jax.jit
+    def update(self, batch, world_model):
+        """Apply one potential-head optimizer update."""
+        return self._update(self, batch, world_model)
+
+    @jax.jit
+    def batch_update(self, batch, world_model):
+        """Apply one potential-head update per leading UTD entry."""
+
+        def scan_update(state, scan_batch):
+            return self._update(state, scan_batch, world_model)
+
+        state, infos = jax.lax.scan(scan_update, self, batch)
+        infos = jax.tree_util.tree_map(lambda value: value.mean(), infos)
+        return state, infos
+
+    @jax.jit
+    def evaluate(self, batch, world_model):
+        """Evaluate continuous-potential metrics without changing state."""
+        _, info = self.potential_loss(
+            batch, world_model, self.network.params
+        )
+        return info
+
+    def _raw_scores(self, latents):
+        normalized_scores = self.network(latents)
+        return (
+            normalized_scores * self.target_std + self.target_mean
+        )
+
+    @jax.jit
+    def evaluate_predicted_future(self, batch, world_model):
+        """Evaluate potential after composing dynamics with the head."""
+        predicted_latents, target_latents = world_model.network(
+            batch["observations"],
+            batch["actions"],
+            batch["target_observations"],
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        target_latents = jax.lax.stop_gradient(target_latents)
+        predictions = self._raw_scores(predicted_latents)
+        encoded_scores = self._raw_scores(target_latents)
+        current_latents = jax.lax.stop_gradient(
+            world_model.network(batch["observations"], method="encode")
+        )
+        current_scores = self._raw_scores(current_latents)
+        targets = batch["target_potentials"].astype(predictions.dtype)
+        current_targets = batch["current_potentials"].astype(
+            predictions.dtype
+        )
+
+        def correlation(left, right):
+            left = left - left.mean()
+            right = right - right.mean()
+            return jnp.sum(left * right) / jnp.sqrt(
+                jnp.sum(jnp.square(left)) * jnp.sum(jnp.square(right))
+            ).clip(1e-8)
+
+        errors = predictions - targets
+        target_variance = jnp.var(targets)
+        predicted_deltas = predictions - current_scores
+        encoded_deltas = encoded_scores - current_scores
+        target_deltas = targets - current_targets
+        delta_mask = (jnp.abs(target_deltas) > 0.01).astype(
+            predictions.dtype
+        )
+        delta_count = jnp.maximum(
+            jnp.sum(delta_mask),
+            jnp.asarray(1.0, dtype=predictions.dtype),
+        )
+        info = {
+            "mae": jnp.mean(jnp.abs(errors)),
+            "correlation": correlation(predictions, targets),
+            "r2": 1.0 - jnp.mean(jnp.square(errors))
+            / target_variance.clip(1e-8),
+            "prediction_mean": jnp.mean(predictions),
+            "prediction_std": jnp.std(predictions),
+            "target_mean": jnp.mean(targets),
+            "target_std": jnp.std(targets),
+            "encoded_mean": jnp.mean(encoded_scores),
+            "encoded_std": jnp.std(encoded_scores),
+            "score_vs_encoded_mae": jnp.mean(
+                jnp.abs(predictions - encoded_scores)
+            ),
+            "score_vs_encoded_correlation": correlation(
+                predictions, encoded_scores
+            ),
+            "delta_correlation": correlation(
+                predicted_deltas, target_deltas
+            ),
+            "delta_mae": jnp.mean(
+                jnp.abs(predicted_deltas - target_deltas)
+            ),
+            "delta_prediction_mean": jnp.mean(predicted_deltas),
+            "delta_prediction_std": jnp.std(predicted_deltas),
+            "delta_target_mean": jnp.mean(target_deltas),
+            "delta_target_std": jnp.std(target_deltas),
+            "delta_vs_encoded_correlation": correlation(
+                predicted_deltas, encoded_deltas
+            ),
+            "encoded_delta_correlation": correlation(
+                encoded_deltas, target_deltas
+            ),
+            "nontrivial_delta_fraction": jnp.mean(delta_mask),
+            "nontrivial_delta_sign_agreement": jnp.sum(
+                (
+                    jnp.sign(predicted_deltas)
+                    == jnp.sign(target_deltas)
+                ).astype(predictions.dtype)
+                * delta_mask
+            ) / delta_count,
+            "latent_mse": jnp.mean(
+                jnp.square(predicted_latents - target_latents)
+            ),
+            "latent_cosine": jnp.mean(
+                jnp.sum(predicted_latents * target_latents, axis=-1)
+                / (
+                    jnp.linalg.norm(predicted_latents, axis=-1)
+                    * jnp.linalg.norm(target_latents, axis=-1)
+                ).clip(1e-8)
+            ),
+        }
+        info["is_finite"] = jnp.logical_and(
+            jnp.all(jnp.isfinite(predictions)),
+            jnp.logical_and(
+                jnp.all(jnp.isfinite(encoded_scores)),
+                jnp.all(jnp.isfinite(jnp.asarray(tuple(info.values())))),
+            ),
+        )
+        return info
+
+    @jax.jit
+    def evaluate_candidates(self, observations, world_model, agent, rng):
+        """Compare critic and predicted-potential candidate rankings."""
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = jnp.clip(
+            agent.compute_flow_actions(candidate_observations, noises),
+            -1,
+            1,
+        )
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        predicted_latents, _ = world_model.network(
+            candidate_observations,
+            action_chunks,
+            candidate_observations,
+        )
+        predicted_latents = jax.lax.stop_gradient(predicted_latents)
+        potential_scores = self._raw_scores(predicted_latents)
+        current_latents = jax.lax.stop_gradient(
+            world_model.network(observations, method="encode")
+        )
+        current_scores = self._raw_scores(current_latents)
+
+        critic_ranks = jnp.argsort(
+            jnp.argsort(critic_scores, axis=-1), axis=-1
+        ).astype(potential_scores.dtype)
+        potential_ranks = jnp.argsort(
+            jnp.argsort(potential_scores, axis=-1), axis=-1
+        ).astype(potential_scores.dtype)
+
+        def mean_correlation(left, right):
+            left = left - left.mean(axis=-1, keepdims=True)
+            right = right - right.mean(axis=-1, keepdims=True)
+            return jnp.mean(
+                jnp.sum(left * right, axis=-1)
+                / jnp.sqrt(
+                    jnp.sum(jnp.square(left), axis=-1)
+                    * jnp.sum(jnp.square(right), axis=-1)
+                ).clip(1e-8)
+            )
+
+        critic_top1 = jnp.argmax(critic_scores, axis=-1)
+        potential_top1 = jnp.argmax(potential_scores, axis=-1)
+        topk = max(1, num_samples // 10)
+        _, critic_topk = jax.lax.top_k(critic_scores, topk)
+        _, potential_topk = jax.lax.top_k(potential_scores, topk)
+        topk_overlap = jnp.mean(
+            jax.vmap(
+                lambda left, right: jnp.mean(
+                    jnp.any(
+                        left[:, None] == right[None, :], axis=-1
+                    ).astype(potential_scores.dtype)
+                )
+            )(critic_topk, potential_topk)
+        )
+        critic_choice_potential_rank = jnp.take_along_axis(
+            potential_ranks, critic_top1[..., None], axis=-1
+        ).squeeze(-1)
+        potential_choice_critic_rank = jnp.take_along_axis(
+            critic_ranks, potential_top1[..., None], axis=-1
+        ).squeeze(-1)
+        rank_denominator = jnp.asarray(
+            max(1, num_samples - 1), dtype=potential_scores.dtype
+        )
+        critic_actions = jnp.take_along_axis(
+            candidate_actions,
+            critic_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        potential_actions = jnp.take_along_axis(
+            candidate_actions,
+            potential_top1[..., None, None],
+            axis=-2,
+        ).squeeze(-2)
+        score_deltas = potential_scores - current_scores[..., None]
+        return {
+            "spearman_correlation": mean_correlation(
+                critic_ranks, potential_ranks
+            ),
+            "score_correlation": mean_correlation(
+                critic_scores, potential_scores
+            ),
+            "top1_agreement": jnp.mean(
+                (critic_top1 == potential_top1).astype(
+                    potential_scores.dtype
+                )
+            ),
+            "topk_overlap": topk_overlap,
+            "random_top1_agreement": jnp.asarray(
+                1.0 / num_samples, dtype=potential_scores.dtype
+            ),
+            "random_topk_overlap": jnp.asarray(
+                topk / num_samples, dtype=potential_scores.dtype
+            ),
+            "critic_choice_potential_percentile": jnp.mean(
+                critic_choice_potential_rank / rank_denominator
+            ),
+            "potential_choice_critic_percentile": jnp.mean(
+                potential_choice_critic_rank / rank_denominator
+            ),
+            "selected_action_l2": jnp.mean(
+                jnp.linalg.norm(
+                    critic_actions - potential_actions, axis=-1
+                )
+            ),
+            "critic_score_std": jnp.mean(
+                jnp.std(critic_scores, axis=-1)
+            ),
+            "candidate_action_std": jnp.mean(
+                jnp.std(candidate_actions, axis=-2)
+            ),
+            "potential_score_std": jnp.mean(
+                jnp.std(potential_scores, axis=-1)
+            ),
+            "current_potential_mean": jnp.mean(current_scores),
+            "candidate_potential_mean": jnp.mean(potential_scores),
+            "candidate_potential_delta_mean": jnp.mean(score_deltas),
+            "candidate_potential_delta_std": jnp.std(score_deltas),
+            "candidate_potential_max_delta_mean": jnp.mean(
+                jnp.max(score_deltas, axis=-1)
+            ),
+            "is_finite": jnp.logical_and(
+                jnp.all(jnp.isfinite(critic_scores)),
+                jnp.all(jnp.isfinite(potential_scores)),
             ),
         }

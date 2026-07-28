@@ -141,7 +141,7 @@ class Dataset(FrozenDict):
         actions = batch_actions  # (batch_size, sequence_length, action_dim)
         next_actions = batch_next_actions  # (batch_size, sequence_length, action_dim)
         
-        return dict(
+        sequence_batch = dict(
             observations=data['observations'].copy(),
             full_observations=observations,
             actions=actions,
@@ -152,6 +152,11 @@ class Dataset(FrozenDict):
             next_observations=next_observations,
             next_actions=next_actions,
         )
+        if 'wm_potentials' in data:
+            sequence_batch['wm_potentials'] = data[
+                'wm_potentials'
+            ].copy()
+        return sequence_batch
 
     def get_subset(self, idxs):
         """Return a subset of the dataset given the indices."""
