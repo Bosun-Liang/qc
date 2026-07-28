@@ -139,6 +139,11 @@ class WorldModel(nn.Module):
         flat_actions = actions.reshape((*actions.shape[:-2], -1))
         return self.dynamics(latents, flat_actions)
 
+    def predict_latent(self, latents, actions):
+        """Advance an already encoded latent by one action chunk."""
+        flat_actions = actions.reshape((*actions.shape[:-2], -1))
+        return self.dynamics(latents, flat_actions)
+
 
 def world_model_loss(apply_fn, params, batch):
     """Compute a terminal-validity-masked latent dynamics loss.
@@ -1485,6 +1490,139 @@ class LatentPotentialTrainState(flax.struct.PyTreeNode):
                 jnp.all(jnp.isfinite(encoded_scores)),
                 jnp.all(jnp.isfinite(jnp.asarray(tuple(info.values())))),
             ),
+        )
+        return info
+
+    @jax.jit
+    def evaluate_multichunk_rollout(self, batch, world_model):
+        """Evaluate recursive latent and potential fidelity read-only."""
+        initial_latents = jax.lax.stop_gradient(
+            world_model.network(batch["observations"], method="encode")
+        )
+        scan_actions = jnp.swapaxes(batch["action_chunks"], 0, 1)
+
+        def rollout_step(latents, action_chunk):
+            next_latents = world_model.network(
+                latents, action_chunk, method="predict_latent"
+            )
+            return next_latents, next_latents
+
+        _, scan_predicted_latents = jax.lax.scan(
+            rollout_step, initial_latents, scan_actions
+        )
+        predicted_latents = jnp.swapaxes(
+            scan_predicted_latents, 0, 1
+        )
+        target_latents = jax.lax.stop_gradient(
+            world_model.network(
+                batch["target_observations"], method="encode"
+            )
+        )
+        predicted_scores = self._raw_scores(predicted_latents)
+        encoded_scores = self._raw_scores(target_latents)
+        current_scores = self._raw_scores(initial_latents)
+        target_potentials = batch["target_potentials"].astype(
+            predicted_scores.dtype
+        )
+        current_potentials = batch["current_potentials"].astype(
+            predicted_scores.dtype
+        )
+
+        def correlation(left, right):
+            left = left - left.mean(axis=0, keepdims=True)
+            right = right - right.mean(axis=0, keepdims=True)
+            covariance = jnp.mean(left * right, axis=0)
+            return covariance / jnp.sqrt(
+                jnp.mean(jnp.square(left), axis=0)
+                * jnp.mean(jnp.square(right), axis=0)
+            ).clip(1e-8)
+
+        latent_cosines = jnp.sum(
+            predicted_latents * target_latents, axis=-1
+        ) / (
+            jnp.linalg.norm(predicted_latents, axis=-1)
+            * jnp.linalg.norm(target_latents, axis=-1)
+        ).clip(1e-8)
+        predicted_deltas = predicted_scores - current_scores[:, None]
+        encoded_deltas = encoded_scores - current_scores[:, None]
+        target_deltas = (
+            target_potentials - current_potentials[:, None]
+        )
+        nontrivial = (jnp.abs(target_deltas) > 0.01).astype(
+            predicted_scores.dtype
+        )
+        nontrivial_count = jnp.maximum(
+            jnp.sum(nontrivial, axis=0),
+            jnp.asarray(1.0, dtype=predicted_scores.dtype),
+        )
+        info = {
+            "latent_mse": jnp.mean(
+                jnp.square(predicted_latents - target_latents),
+                axis=(0, 2),
+            ),
+            "latent_cosine": jnp.mean(latent_cosines, axis=0),
+            "predicted_latent_std": jnp.mean(
+                jnp.std(predicted_latents, axis=0), axis=-1
+            ),
+            "target_latent_std": jnp.mean(
+                jnp.std(target_latents, axis=0), axis=-1
+            ),
+            "predicted_latent_norm": jnp.mean(
+                jnp.linalg.norm(predicted_latents, axis=-1), axis=0
+            ),
+            "target_latent_norm": jnp.mean(
+                jnp.linalg.norm(target_latents, axis=-1), axis=0
+            ),
+            "score_vs_encoded_mae": jnp.mean(
+                jnp.abs(predicted_scores - encoded_scores), axis=0
+            ),
+            "score_vs_encoded_correlation": correlation(
+                predicted_scores, encoded_scores
+            ),
+            "score_vs_target_mae": jnp.mean(
+                jnp.abs(predicted_scores - target_potentials), axis=0
+            ),
+            "score_vs_target_correlation": correlation(
+                predicted_scores, target_potentials
+            ),
+            "encoded_score_vs_target_correlation": correlation(
+                encoded_scores, target_potentials
+            ),
+            "predicted_delta_vs_target_correlation": correlation(
+                predicted_deltas, target_deltas
+            ),
+            "encoded_delta_vs_target_correlation": correlation(
+                encoded_deltas, target_deltas
+            ),
+            "predicted_delta_vs_encoded_correlation": correlation(
+                predicted_deltas, encoded_deltas
+            ),
+            "predicted_delta_mae": jnp.mean(
+                jnp.abs(predicted_deltas - target_deltas), axis=0
+            ),
+            "predicted_delta_std": jnp.std(
+                predicted_deltas, axis=0
+            ),
+            "target_delta_std": jnp.std(target_deltas, axis=0),
+            "nontrivial_delta_fraction": jnp.mean(
+                nontrivial, axis=0
+            ),
+            "nontrivial_delta_sign_agreement": jnp.sum(
+                (
+                    jnp.sign(predicted_deltas)
+                    == jnp.sign(target_deltas)
+                ).astype(predicted_scores.dtype)
+                * nontrivial,
+                axis=0,
+            )
+            / nontrivial_count,
+        }
+        info["is_finite"] = jnp.all(
+            jnp.isfinite(
+                jnp.concatenate(
+                    [jnp.ravel(value) for value in info.values()]
+                )
+            )
         )
         return info
 

@@ -60,6 +60,21 @@ flags.DEFINE_integer(
     'Number of held-out batches used by candidate_diagnostic_only.',
 )
 flags.DEFINE_bool(
+    "rollout_diagnostic_only",
+    False,
+    "Only evaluate recursive world-model rollout fidelity and exit.",
+)
+flags.DEFINE_integer(
+    "rollout_diagnostic_batches",
+    16,
+    "Number of fixed held-out batches used by rollout diagnostics.",
+)
+flags.DEFINE_integer(
+    "rollout_diagnostic_chunks",
+    8,
+    "Maximum number of recursively predicted action chunks.",
+)
+flags.DEFINE_bool(
     'wm_progress_only',
     False,
     'Freeze agent/world-model states and train only the progress head.',
@@ -172,6 +187,40 @@ def main(_):
         json.dump(flag_dict, f)
 
     config = FLAGS.agent
+    if FLAGS.rollout_diagnostic_only:
+        if FLAGS.restore_file is None:
+            raise ValueError(
+                "--rollout_diagnostic_only requires --restore_file"
+            )
+        if FLAGS.offline_steps != 0 or FLAGS.online_steps != 0:
+            raise ValueError(
+                "--rollout_diagnostic_only requires offline_steps=0 and "
+                "online_steps=0"
+            )
+        if FLAGS.eval_only or FLAGS.candidate_diagnostic_only:
+            raise ValueError(
+                "--rollout_diagnostic_only is mutually exclusive with "
+                "eval_only and candidate_diagnostic_only"
+            )
+        if not config.get("wm_enabled", False) or not config.get(
+            "wm_potential_enabled", False
+        ):
+            raise ValueError(
+                "--rollout_diagnostic_only requires wm_enabled=True and "
+                "wm_potential_enabled=True"
+            )
+        if not config["action_chunking"]:
+            raise ValueError(
+                "--rollout_diagnostic_only requires action_chunking=True"
+            )
+        if FLAGS.rollout_diagnostic_batches <= 0:
+            raise ValueError(
+                "--rollout_diagnostic_batches must be positive"
+            )
+        if FLAGS.rollout_diagnostic_chunks <= 0:
+            raise ValueError(
+                "--rollout_diagnostic_chunks must be positive"
+            )
     if FLAGS.wm_score_eval_enabled and not FLAGS.eval_only:
         raise ValueError(
             "--wm_score_eval_enabled is restricted to --eval_only=True"
@@ -757,6 +806,8 @@ def main(_):
     prefixes = ["eval", "env"]
     if FLAGS.candidate_diagnostic_only:
         prefixes.append("candidate_diagnostic")
+    if FLAGS.rollout_diagnostic_only:
+        prefixes.append("rollout_diagnostic")
     if FLAGS.offline_steps > 0:
         prefixes.append("offline_agent")
     if FLAGS.online_steps > 0:
@@ -767,6 +818,122 @@ def main(_):
                     for prefix in prefixes},
         wandb_logger=wandb,
     )
+
+    if FLAGS.rollout_diagnostic_only:
+        horizon_length = config["horizon_length"]
+        num_chunks = FLAGS.rollout_diagnostic_chunks
+        max_horizon = horizon_length * num_chunks
+        diagnostic_dataset = potential_validation_dataset
+        max_start = diagnostic_dataset.size - max_horizon
+        if max_start <= 0:
+            raise ValueError(
+                "Validation dataset is shorter than the requested rollout"
+            )
+        terminals = np.asarray(
+            diagnostic_dataset["terminals"]
+        ).reshape(-1)
+        terminal_prefix = np.concatenate(
+            ([0], np.cumsum(terminals > 0))
+        )
+        terminal_counts = (
+            terminal_prefix[max_horizon:max_horizon + max_start]
+            - terminal_prefix[:max_start]
+        )
+        valid_starts = np.flatnonzero(terminal_counts == 0)
+        if len(valid_starts) == 0:
+            raise ValueError(
+                "No terminal-valid multi-chunk rollout starts found"
+            )
+
+        numpy_rng_state = np.random.get_state()
+        np.random.seed(FLAGS.seed + 60_000)
+        rollout_infos = []
+        try:
+            for _ in range(FLAGS.rollout_diagnostic_batches):
+                starts = np.random.choice(
+                    valid_starts,
+                    size=config["batch_size"],
+                    replace=len(valid_starts) < config["batch_size"],
+                )
+                action_indices = (
+                    starts[:, None]
+                    + np.arange(max_horizon)[None, :]
+                )
+                target_indices = (
+                    starts[:, None]
+                    + horizon_length
+                    * np.arange(1, num_chunks + 1)[None, :]
+                )
+                action_chunks = diagnostic_dataset["actions"][
+                    action_indices
+                ].reshape(
+                    len(starts),
+                    num_chunks,
+                    horizon_length,
+                    -1,
+                )
+                rollout_infos.append(
+                    world_model_potential.evaluate_multichunk_rollout(
+                        {
+                            "observations": diagnostic_dataset[
+                                "observations"
+                            ][starts],
+                            "action_chunks": action_chunks,
+                            "target_observations": diagnostic_dataset[
+                                "observations"
+                            ][target_indices],
+                            "current_potentials": diagnostic_dataset[
+                                "wm_potentials"
+                            ][starts],
+                            "target_potentials": diagnostic_dataset[
+                                "wm_potentials"
+                            ][target_indices],
+                        },
+                        world_model,
+                    )
+                )
+        finally:
+            np.random.set_state(numpy_rng_state)
+
+        rollout_info = jax.tree_util.tree_map(
+            lambda *values: np.mean(np.asarray(values), axis=0),
+            *rollout_infos,
+        )
+        selected_chunks = []
+        chunk = 1
+        while chunk <= num_chunks:
+            selected_chunks.append(chunk)
+            chunk *= 2
+        if selected_chunks[-1] != num_chunks:
+            selected_chunks.append(num_chunks)
+        flat_rollout_info = {
+            "valid_start_count": np.asarray(len(valid_starts)),
+            "is_finite": np.asarray(rollout_info["is_finite"]),
+        }
+        for chunk in selected_chunks:
+            for key, value in rollout_info.items():
+                value = np.asarray(value)
+                if value.ndim == 0:
+                    continue
+                flat_rollout_info[
+                    f"h{chunk * horizon_length:02d}/{key}"
+                ] = value[chunk - 1]
+
+        print("Read-only multi-chunk rollout fidelity diagnostic:")
+        for key in sorted(flat_rollout_info):
+            print(
+                f"  {key}: {float(flat_rollout_info[key]):.6f}",
+                flush=True,
+            )
+        logger.log(
+            flat_rollout_info,
+            "rollout_diagnostic",
+            step=log_step,
+        )
+        for csv_logger in logger.csv_loggers.values():
+            csv_logger.close()
+        wandb.finish()
+        return
 
     if FLAGS.eval_only:
         if FLAGS.restore_file is None:

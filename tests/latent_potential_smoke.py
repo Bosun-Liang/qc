@@ -116,6 +116,73 @@ def main():
     ) <= 1.0
     assert -1.0 <= float(future_info["latent_cosine"]) <= 1.0
 
+    encoded_observations = world_model.network(
+        observations, method="encode"
+    )
+    observation_predictions = world_model.network(
+        observations, actions, method="predict"
+    )
+    latent_predictions = world_model.network(
+        encoded_observations, actions, method="predict_latent"
+    )
+    assert bool(jnp.array_equal(observation_predictions, latent_predictions))
+
+    num_chunks = 4
+    rollout_info = potential.evaluate_multichunk_rollout(
+        {
+            "observations": observations,
+            "action_chunks": jnp.stack(
+                [actions] * num_chunks, axis=1
+            ),
+            "target_observations": jnp.stack(
+                [
+                    jnp.roll(
+                        next_observations[:, -1],
+                        shift=chunk,
+                        axis=0,
+                    )
+                    for chunk in range(num_chunks)
+                ],
+                axis=1,
+            ),
+            "current_potentials": potentials,
+            "target_potentials": jnp.stack(
+                [
+                    jnp.roll(potentials, shift=chunk + 1)
+                    for chunk in range(num_chunks)
+                ],
+                axis=1,
+            ),
+        },
+        world_model,
+    )
+    assert bool(rollout_info["is_finite"])
+    for key, value in rollout_info.items():
+        if key == "is_finite":
+            continue
+        assert value.shape == (num_chunks,)
+        assert bool(jnp.all(jnp.isfinite(value)))
+    assert bool(jnp.all(rollout_info["latent_cosine"] <= 1.0))
+    assert bool(jnp.all(rollout_info["latent_cosine"] >= -1.0))
+    assert bool(
+        jnp.all(
+            rollout_info["score_vs_encoded_correlation"] <= 1.0
+        )
+    )
+    assert bool(
+        jnp.all(
+            rollout_info["score_vs_encoded_correlation"] >= -1.0
+        )
+    )
+
+    assert all(
+        bool(jnp.array_equal(before, after))
+        for before, after in zip(
+            jax.tree_util.tree_leaves(world_model_before),
+            jax.tree_util.tree_leaves(world_model),
+        )
+    )
+
     candidate_info = potential.evaluate_candidates(
         observations,
         world_model,
