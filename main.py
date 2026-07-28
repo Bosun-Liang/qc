@@ -1,4 +1,5 @@
 import glob, tqdm, wandb, os, json, random, time, jax
+import functools
 from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, get_wandb_video
@@ -24,7 +25,7 @@ def is_robomimic_env(env_name):
 from utils.flax_utils import save_agent, restore_agent_with_file
 from utils.datasets import Dataset, ReplayBuffer
 
-from evaluation import evaluate
+from evaluation import evaluate, flatten
 from agents import agents
 from agents.world_model import LatentValueTrainState, WorldModelTrainState
 import numpy as np
@@ -51,6 +52,21 @@ flags.DEFINE_integer(
     'candidate_diagnostic_batches',
     16,
     'Number of held-out batches used by candidate_diagnostic_only.',
+)
+flags.DEFINE_bool(
+    'wm_score_eval_enabled',
+    False,
+    'Use normalized critic plus latent-value scoring in eval-only mode.',
+)
+flags.DEFINE_float(
+    'wm_score_lambda',
+    0.0,
+    'Latent-value coefficient used when wm_score_eval_enabled is true.',
+)
+flags.DEFINE_integer(
+    'eval_seed',
+    None,
+    'Optional deterministic per-episode seed for eval-only comparisons.',
 )
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
@@ -104,6 +120,10 @@ def main(_):
         json.dump(flag_dict, f)
 
     config = FLAGS.agent
+    if FLAGS.wm_score_eval_enabled and not FLAGS.eval_only:
+        raise ValueError(
+            "--wm_score_eval_enabled is restricted to --eval_only=True"
+        )
     
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
@@ -275,15 +295,81 @@ def main(_):
         if FLAGS.restore_file is None:
             raise ValueError("--eval_only requires --restore_file")
 
-        eval_info, _, renders = evaluate(
+        if FLAGS.candidate_diagnostic_only:
+            raise ValueError(
+                "--eval_only and --candidate_diagnostic_only are mutually "
+                "exclusive"
+            )
+
+        sample_actions_fn = None
+        if FLAGS.wm_score_eval_enabled:
+            if world_model is None or world_model_value is None:
+                raise ValueError(
+                    "--wm_score_eval_enabled requires wm_enabled=True and "
+                    "wm_value_enabled=True"
+                )
+            if config["actor_type"] != "best-of-n":
+                raise ValueError(
+                    "--wm_score_eval_enabled requires actor_type=best-of-n"
+                )
+            if not config["action_chunking"]:
+                raise ValueError(
+                    "--wm_score_eval_enabled requires action_chunking=True"
+                )
+            if FLAGS.wm_score_lambda < 0:
+                raise ValueError("--wm_score_lambda must be non-negative")
+            sample_actions_fn = functools.partial(
+                world_model_value.sample_actions,
+                world_model=world_model,
+                agent=agent,
+                score_lambda=FLAGS.wm_score_lambda,
+            )
+            print(
+                "Evaluation-only world-model scoring enabled with "
+                f"lambda={FLAGS.wm_score_lambda}.",
+                flush=True,
+            )
+
+        eval_info, eval_trajs, renders = evaluate(
             agent=agent,
             env=eval_env,
             action_dim=example_batch["actions"].shape[-1],
             num_eval_episodes=FLAGS.eval_episodes,
             num_video_episodes=FLAGS.video_episodes,
             video_frame_skip=FLAGS.video_frame_skip,
+            sample_actions_fn=sample_actions_fn,
+            eval_seed=FLAGS.eval_seed,
         )
         logger.log(eval_info, "eval", step=log_step)
+
+        if FLAGS.eval_seed is not None:
+            episode_logger = CsvLogger(
+                os.path.join(FLAGS.save_dir, "eval_episodes.csv")
+            )
+            for episode_index, trajectory in enumerate(eval_trajs):
+                final_info = flatten(trajectory["info"][-1])
+                success = final_info.get("success")
+                if success is None:
+                    success_values = [
+                        value
+                        for key, value in final_info.items()
+                        if key.endswith(".success")
+                    ]
+                    success = (
+                        success_values[0]
+                        if len(success_values) == 1
+                        else np.nan
+                    )
+                episode_logger.log(
+                    {
+                        "episode_seed": FLAGS.eval_seed + episode_index,
+                        "success": success,
+                        "return": np.sum(trajectory["reward"]),
+                        "length": len(trajectory["reward"]),
+                    },
+                    step=episode_index,
+                )
+            episode_logger.close()
 
         if renders:
             run.log(

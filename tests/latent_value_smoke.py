@@ -135,6 +135,29 @@ def main():
         assert float(candidate_info[f"lambda_{label}/critic_regret_z"]) >= 0.0
         assert float(candidate_info[f"lambda_{label}/value_regret_z"]) >= 0.0
 
+    for action_observations in (observations[0], observations):
+        action_rng = jax.random.PRNGKey(4)
+        baseline_actions = agent.sample_actions(
+            action_observations, rng=action_rng
+        )
+        zero_lambda_actions = value_state.sample_actions(
+            action_observations,
+            world_model,
+            agent,
+            action_rng,
+            score_lambda=0.0,
+        )
+        assert bool(jnp.array_equal(baseline_actions, zero_lambda_actions))
+        scored_actions = value_state.sample_actions(
+            action_observations,
+            world_model,
+            agent,
+            action_rng,
+            score_lambda=0.1,
+        )
+        assert scored_actions.shape == baseline_actions.shape
+        assert bool(jnp.all(jnp.isfinite(scored_actions)))
+
     utd_batch = jax.tree_util.tree_map(
         lambda value: jnp.stack((value, value), axis=0),
         batch,

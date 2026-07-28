@@ -45,6 +45,8 @@ def evaluate(
     action_shape=None,
     observation_shape=None,
     action_dim=None,
+    sample_actions_fn=None,
+    eval_seed=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -60,7 +62,16 @@ def evaluate(
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    action_sampler = (
+        agent.sample_actions
+        if sample_actions_fn is None
+        else sample_actions_fn
+    )
+    if eval_seed is None:
+        actor_fn = supply_rng(
+            action_sampler,
+            rng=jax.random.PRNGKey(np.random.randint(0, 2**32)),
+        )
     trajs = []
     stats = defaultdict(list)
 
@@ -69,7 +80,14 @@ def evaluate(
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        observation, info = env.reset()
+        if eval_seed is None:
+            observation, info = env.reset()
+        else:
+            actor_fn = supply_rng(
+                action_sampler,
+                rng=jax.random.PRNGKey(eval_seed + i),
+            )
+            observation, info = env.reset(seed=eval_seed + i)
             
         observation_history = []
         action_history = []

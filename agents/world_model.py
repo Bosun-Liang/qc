@@ -603,3 +603,79 @@ class LatentValueTrainState(flax.struct.PyTreeNode):
             )
 
         return info
+
+    @jax.jit
+    def sample_actions(
+        self,
+        observations,
+        world_model,
+        agent,
+        rng,
+        score_lambda=0.0,
+    ):
+        """Select best-of-N actions with an optional latent-value score.
+
+        A zero coefficient follows the original critic-only argmax exactly.
+        This method is kept separate from `ACFQLAgent.sample_actions` so the
+        default policy and all training paths remain unchanged.
+        """
+        num_samples = agent.config["actor_num_samples"]
+        horizon_length = agent.config["horizon_length"]
+        action_dim = agent.config["action_dim"]
+        flat_action_dim = action_dim * horizon_length
+
+        noises = jax.random.normal(
+            rng,
+            (*observations.shape[:-1], num_samples, flat_action_dim),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :], num_samples, axis=-2
+        )
+        candidate_actions = agent.compute_flow_actions(
+            candidate_observations, noises
+        )
+        candidate_actions = jnp.clip(candidate_actions, -1, 1)
+
+        candidate_qs = agent.network.select("critic")(
+            candidate_observations, actions=candidate_actions
+        )
+        if agent.config["q_agg"] == "min":
+            critic_scores = candidate_qs.min(axis=0)
+        else:
+            critic_scores = candidate_qs.mean(axis=0)
+
+        action_chunks = candidate_actions.reshape(
+            (*candidate_actions.shape[:-1], horizon_length, action_dim)
+        )
+        predicted_latents, _ = world_model.network(
+            candidate_observations,
+            action_chunks,
+            candidate_observations,
+        )
+        value_scores = self.network(predicted_latents)
+
+        normalized_critic_scores = (
+            critic_scores - critic_scores.mean(axis=-1, keepdims=True)
+        ) / jnp.std(critic_scores, axis=-1, keepdims=True).clip(1e-6)
+        normalized_value_scores = (
+            value_scores - value_scores.mean(axis=-1, keepdims=True)
+        ) / jnp.std(value_scores, axis=-1, keepdims=True).clip(1e-6)
+        mixed_scores = (
+            normalized_critic_scores
+            + score_lambda * normalized_value_scores
+        )
+        selection_scores = jax.lax.cond(
+            jnp.asarray(score_lambda) == 0,
+            lambda: critic_scores,
+            lambda: mixed_scores,
+        )
+        indices = jnp.argmax(selection_scores, axis=-1)
+
+        batch_shape = indices.shape
+        flat_indices = indices.reshape(-1)
+        batch_size = len(flat_indices)
+        return candidate_actions.reshape(
+            (-1, num_samples, flat_action_dim)
+        )[jnp.arange(batch_size), flat_indices, :].reshape(
+            batch_shape + (flat_action_dim,)
+        )
