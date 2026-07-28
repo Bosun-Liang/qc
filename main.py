@@ -355,14 +355,22 @@ def main(_):
             lambda *values: np.std(np.asarray(values), axis=0),
             *candidate_infos,
         )
-        for key in (
+        batch_std_keys = [
             "spearman_correlation",
             "score_correlation",
             "top1_agreement",
             "topk_overlap",
             "critic_choice_value_percentile",
             "value_choice_critic_percentile",
-        ):
+        ]
+        batch_std_keys.extend(
+            key
+            for key in candidate_info
+            if key.startswith("lambda_")
+            and key.rsplit("/", 1)[-1]
+            in ("change_rate", "critic_percentile", "value_percentile")
+        )
+        for key in batch_std_keys:
             candidate_info[f"{key}_batch_std"] = candidate_batch_std[key]
 
         print("Read-only candidate ranking diagnostic:", flush=True)

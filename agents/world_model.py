@@ -493,7 +493,7 @@ class LatentValueTrainState(flax.struct.PyTreeNode):
             axis=-2,
         ).squeeze(-2)
 
-        return {
+        info = {
             "spearman_correlation": mean_correlation(
                 critic_ranks, value_ranks
             ),
@@ -527,3 +527,79 @@ class LatentValueTrainState(flax.struct.PyTreeNode):
                 jnp.all(jnp.isfinite(value_scores)),
             ),
         }
+
+        critic_score_std = jnp.std(
+            critic_scores, axis=-1, keepdims=True
+        ).clip(1e-6)
+        value_score_std = jnp.std(
+            value_scores, axis=-1, keepdims=True
+        ).clip(1e-6)
+        normalized_critic_scores = (
+            critic_scores - critic_scores.mean(axis=-1, keepdims=True)
+        ) / critic_score_std
+        normalized_value_scores = (
+            value_scores - value_scores.mean(axis=-1, keepdims=True)
+        ) / value_score_std
+
+        for score_lambda, label in (
+            (0.0, "0"),
+            (0.05, "0p05"),
+            (0.1, "0p1"),
+            (0.25, "0p25"),
+            (0.5, "0p5"),
+            (1.0, "1"),
+        ):
+            mixed_scores = (
+                normalized_critic_scores
+                + score_lambda * normalized_value_scores
+            )
+            mixed_top1 = jnp.argmax(mixed_scores, axis=-1)
+            mixed_critic_rank = jnp.take_along_axis(
+                critic_ranks, mixed_top1[..., None], axis=-1
+            ).squeeze(-1)
+            mixed_value_rank = jnp.take_along_axis(
+                value_ranks, mixed_top1[..., None], axis=-1
+            ).squeeze(-1)
+            mixed_critic_score = jnp.take_along_axis(
+                normalized_critic_scores,
+                mixed_top1[..., None],
+                axis=-1,
+            ).squeeze(-1)
+            mixed_value_score = jnp.take_along_axis(
+                normalized_value_scores,
+                mixed_top1[..., None],
+                axis=-1,
+            ).squeeze(-1)
+            mixed_actions = jnp.take_along_axis(
+                candidate_actions,
+                mixed_top1[..., None, None],
+                axis=-2,
+            ).squeeze(-2)
+            prefix = f"lambda_{label}"
+            info[f"{prefix}/change_rate"] = jnp.mean(
+                (mixed_top1 != critic_top1).astype(value_scores.dtype)
+            )
+            info[f"{prefix}/critic_percentile"] = jnp.mean(
+                mixed_critic_rank / rank_denominator
+            )
+            info[f"{prefix}/value_percentile"] = jnp.mean(
+                mixed_value_rank / rank_denominator
+            )
+            info[f"{prefix}/critic_regret_z"] = jnp.mean(
+                jnp.max(normalized_critic_scores, axis=-1)
+                - mixed_critic_score
+            )
+            info[f"{prefix}/value_regret_z"] = jnp.mean(
+                jnp.max(normalized_value_scores, axis=-1)
+                - mixed_value_score
+            )
+            info[f"{prefix}/value_top1_agreement"] = jnp.mean(
+                (mixed_top1 == value_top1).astype(value_scores.dtype)
+            )
+            info[f"{prefix}/action_l2_from_critic"] = jnp.mean(
+                jnp.linalg.norm(
+                    mixed_actions - critic_selected_actions, axis=-1
+                )
+            )
+
+        return info

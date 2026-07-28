@@ -115,6 +115,25 @@ def main():
         <= float(candidate_info["value_choice_critic_percentile"])
         <= 1.0
     )
+    assert all(
+        bool(jnp.isfinite(value)) for value in candidate_info.values()
+    )
+    assert float(candidate_info["lambda_0/change_rate"]) == 0.0
+    assert float(candidate_info["lambda_0/critic_percentile"]) == 1.0
+    assert float(candidate_info["lambda_0/critic_regret_z"]) == 0.0
+    assert float(candidate_info["lambda_0/action_l2_from_critic"]) == 0.0
+    for label in ("0", "0p05", "0p1", "0p25", "0p5", "1"):
+        assert 0.0 <= float(
+            candidate_info[f"lambda_{label}/change_rate"]
+        ) <= 1.0
+        assert 0.0 <= float(
+            candidate_info[f"lambda_{label}/critic_percentile"]
+        ) <= 1.0
+        assert 0.0 <= float(
+            candidate_info[f"lambda_{label}/value_percentile"]
+        ) <= 1.0
+        assert float(candidate_info[f"lambda_{label}/critic_regret_z"]) >= 0.0
+        assert float(candidate_info[f"lambda_{label}/value_regret_z"]) >= 0.0
 
     utd_batch = jax.tree_util.tree_map(
         lambda value: jnp.stack((value, value), axis=0),
