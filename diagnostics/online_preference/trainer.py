@@ -1,6 +1,7 @@
 """Offline-initialized online preference selector trainer."""
 
 import json
+import shutil
 from itertools import combinations
 from pathlib import Path
 
@@ -147,12 +148,19 @@ def _pairwise_loss(params, apply_fn, observations, actions, returns, valid, epsi
     valid_count = jnp.maximum(valid.sum(), 1)
     score_mean = (scores * valid).sum() / valid_count
     score_variance = (((scores - score_mean) ** 2) * valid).sum() / valid_count
+    valid_max = jnp.max(jnp.where(valid, scores, -jnp.inf), axis=1)
+    valid_min = jnp.min(jnp.where(valid, scores, jnp.inf), axis=1)
+    state_valid = valid.sum(axis=1) > 1
+    score_spread = jnp.sum((valid_max - valid_min) * state_valid) / jnp.maximum(
+        state_valid.sum(), 1
+    )
     return loss, {
         "loss": loss,
         "pairwise_accuracy": (correct * pair_valid).sum() / count,
         "pair_count": pair_valid.sum(),
         "score_mean": score_mean,
         "score_std": jnp.sqrt(score_variance),
+        "score_spread": score_spread,
     }
 
 
@@ -192,6 +200,8 @@ class OnlineSelectorTrainer:
         learning_rate=3e-4,
         weight_decay=1e-4,
         gradient_clip=1.0,
+        normalized_input_clip=0.0,
+        select_best_holdout_checkpoint=False,
     ):
         self.output_dir = Path(output_dir)
         self.checkpoint_dir = self.output_dir / "selector_checkpoints"
@@ -199,6 +209,18 @@ class OnlineSelectorTrainer:
         self.seed = seed
         self.rng = np.random.default_rng(seed + 80_080)
         self.pair_epsilon = float(pair_epsilon)
+        self.normalized_input_clip = (
+            float(normalized_input_clip)
+            if normalized_input_clip is not None and normalized_input_clip > 0
+            else None
+        )
+        self.select_best_holdout_checkpoint = bool(select_best_holdout_checkpoint)
+        self.latest_checkpoint_path = self.checkpoint_dir / "latest_online.pkl"
+        self.latest_metadata_path = self.checkpoint_dir / "latest_online.json"
+        self.best_checkpoint_path = self.checkpoint_dir / "best_online.pkl"
+        self.best_metadata_path = self.checkpoint_dir / "best_online.json"
+        self.best_holdout_key = None
+        self.best_holdout_metadata = None
         base_template = create_low_capacity_state("small_mlp", seed)
         restored = restore_state(checkpoint, base_template)
         second = restore_state(checkpoint, create_low_capacity_state("small_mlp", seed))
@@ -244,6 +266,8 @@ class OnlineSelectorTrainer:
         offline_observations, offline_actions = normalized_state_inputs(
             self.offline, computed
         )
+        offline_observations = self._clip_normalized(offline_observations)
+        offline_actions = self._clip_normalized(offline_actions)
         self.offline_observations = offline_observations
         self.offline_actions = offline_actions
         fixed_predictions = np.asarray(
@@ -255,6 +279,21 @@ class OnlineSelectorTrainer:
         np.testing.assert_array_equal(fixed_predictions, second_predictions)
         self.initial_fixed_prediction = fixed_predictions
         self.update_index = 0
+        if self.select_best_holdout_checkpoint and self.best_metadata_path.exists():
+            with open(self.best_metadata_path) as file:
+                self.best_holdout_metadata = json.load(file)
+            self.best_holdout_key = tuple(
+                self.best_holdout_metadata["selection_key"]
+            )
+
+    def _clip_normalized(self, values):
+        if self.normalized_input_clip is None:
+            return values
+        return np.clip(
+            values,
+            -self.normalized_input_clip,
+            self.normalized_input_clip,
+        )
 
     def normalized_online(self, records):
         count = len(records)
@@ -266,6 +305,8 @@ class OnlineSelectorTrainer:
         action_z = (
             actions4 - self.normalization["action_mean"]
         ) / self.normalization["action_std"]
+        observation_z = self._clip_normalized(observation_z)
+        action_z = self._clip_normalized(action_z)
         repeated_observations = np.repeat(observation_z[:, None, :], 4, axis=1)
         return repeated_observations.astype(np.float32), action_z.astype(np.float32)
 
@@ -282,15 +323,90 @@ class OnlineSelectorTrainer:
         action_z = (
             candidate_chunks.reshape(4, 25) - self.normalization["action_mean"]
         ) / self.normalization["action_std"]
-        values = np.concatenate([observation_z.reshape(-1), action_z.reshape(-1)])
+        pre_clip_values = np.concatenate(
+            [observation_z.reshape(-1), action_z.reshape(-1)]
+        )
+        clipped_observation_z = self._clip_normalized(observation_z)
+        clipped_action_z = self._clip_normalized(action_z)
+        post_clip_values = np.concatenate(
+            [clipped_observation_z.reshape(-1), clipped_action_z.reshape(-1)]
+        )
         return {
-            "normalized_abs_max": float(np.max(np.abs(values))),
-            "fraction_abs_gt_3": float(np.mean(np.abs(values) > 3)),
-            "fraction_abs_gt_5": float(np.mean(np.abs(values) > 5)),
-            "is_ood": bool(np.any(np.abs(values) > 5)),
+            "normalized_abs_max": float(np.max(np.abs(pre_clip_values))),
+            "fraction_abs_gt_3": float(np.mean(np.abs(pre_clip_values) > 3)),
+            "fraction_abs_gt_5": float(np.mean(np.abs(pre_clip_values) > 5)),
+            "is_ood": bool(np.any(np.abs(pre_clip_values) > 5)),
+            "pre_clip_normalized_abs_max": float(np.max(np.abs(pre_clip_values))),
+            "post_clip_normalized_abs_max": float(np.max(np.abs(post_clip_values))),
+            "normalized_feature_clipped_fraction": float(
+                np.mean(pre_clip_values != post_clip_values)
+            ),
             "observation_normalized_abs_max": np.abs(observation_z).astype(np.float32),
             "action_normalized_abs_max": np.max(np.abs(action_z), axis=0).astype(np.float32),
         }
+
+    def consider_best_holdout_checkpoint(
+        self,
+        latest_checkpoint,
+        recent_holdout,
+        minimum_holdout_states,
+        main_env_step,
+    ):
+        result = {
+            "best_checkpoint_updated": False,
+            "best_checkpoint_path": (
+                str(self.best_checkpoint_path)
+                if self.best_checkpoint_path.exists()
+                else None
+            ),
+        }
+        if not self.select_best_holdout_checkpoint:
+            result["best_checkpoint_status"] = "disabled"
+            return result
+        states = int(
+            recent_holdout.get(
+                "states",
+                recent_holdout.get("selector", {}).get("states", 0),
+            )
+        )
+        if recent_holdout.get("status") != "ok" or states < minimum_holdout_states:
+            result["best_checkpoint_status"] = "insufficient_holdout"
+            return result
+        selector = recent_holdout["selector"]
+        regret = float(selector["top1_regret"])
+        pairwise = float(selector["pairwise_accuracy"])
+        spearman = float(selector["spearman"])
+        selection_key = (regret, -pairwise, -spearman)
+        result["best_checkpoint_candidate"] = {
+            "holdout_states": states,
+            "top1_regret": regret,
+            "pairwise_accuracy": pairwise,
+            "spearman": spearman,
+            "selection_key": list(selection_key),
+        }
+        if self.best_holdout_key is None or selection_key < self.best_holdout_key:
+            shutil.copyfile(latest_checkpoint, self.best_checkpoint_path)
+            self.best_holdout_key = selection_key
+            self.best_holdout_metadata = {
+                "source_checkpoint": str(latest_checkpoint),
+                "best_checkpoint_path": str(self.best_checkpoint_path),
+                "main_env_step": int(main_env_step),
+                "update_index": int(self.update_index),
+                **result["best_checkpoint_candidate"],
+            }
+            with open(self.best_metadata_path, "w") as file:
+                json.dump(self.best_holdout_metadata, file, indent=2, sort_keys=True)
+            result["best_checkpoint_updated"] = True
+            result["best_checkpoint_status"] = "updated"
+        else:
+            result["best_checkpoint_status"] = "kept_previous"
+        result["best_checkpoint_path"] = (
+            str(self.best_checkpoint_path)
+            if self.best_checkpoint_path.exists()
+            else None
+        )
+        result["best_checkpoint_metadata"] = self.best_holdout_metadata
+        return result
 
     def _mixed_batch(self, online_records, batch_states):
         desired_online = int(round(0.75 * batch_states))
@@ -362,6 +478,19 @@ class OnlineSelectorTrainer:
         self.update_index += 1
         checkpoint = self.checkpoint_dir / f"update_{self.update_index:04d}.pkl"
         save_state(checkpoint, self.state)
+        shutil.copyfile(checkpoint, self.latest_checkpoint_path)
+        with open(self.latest_metadata_path, "w") as file:
+            json.dump(
+                {
+                    "source_checkpoint": str(checkpoint),
+                    "latest_checkpoint_path": str(self.latest_checkpoint_path),
+                    "main_env_step": int(main_env_step),
+                    "update_index": int(self.update_index),
+                },
+                file,
+                indent=2,
+                sort_keys=True,
+            )
         elapsed = __import__("time").time() - started
         total_examples = online_examples + offline_examples
         return {
@@ -377,6 +506,9 @@ class OnlineSelectorTrainer:
             ),
             "score_mean": float(np.mean([value["score_mean"] for value in metrics])),
             "score_std": float(np.mean([value["score_std"] for value in metrics])),
+            "score_spread": float(
+                np.mean([value["score_spread"] for value in metrics])
+            ),
             "online_batch_fraction": online_examples / total_examples,
             "offline_batch_fraction": offline_examples / total_examples,
             "online_state_reuse_per_update": online_examples / len(online_records),

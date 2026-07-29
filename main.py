@@ -179,6 +179,17 @@ flags.DEFINE_integer('preference_min_online_states', 50, 'Minimum online train s
 flags.DEFINE_integer('preference_update_every_states', 20, 'New train states between update phases.')
 flags.DEFINE_integer('preference_gradient_steps', 200, 'Gradient steps per selector update phase.')
 flags.DEFINE_integer('preference_batch_states', 32, 'State groups per selector batch.')
+flags.DEFINE_float('preference_learning_rate', 3e-4, 'Online selector learning rate.')
+flags.DEFINE_float(
+    'preference_normalized_input_clip',
+    0.0,
+    'Absolute clip after fixed normalization; non-positive disables clipping.',
+)
+flags.DEFINE_bool(
+    'preference_select_best_holdout_checkpoint',
+    False,
+    'Select a best online checkpoint using recent episode-grouped holdout.',
+)
 flags.DEFINE_string('preference_output_dir', None, 'Independent preference shadow output directory.')
 flags.DEFINE_integer('preference_holdout_modulus', 5, 'episode_id modulus used for holdout.')
 flags.DEFINE_integer('preference_holdout_remainder', 0, 'episode_id remainder assigned to holdout.')
@@ -1768,6 +1779,9 @@ def main(_):
             update_every_states=FLAGS.preference_update_every_states,
             gradient_steps=FLAGS.preference_gradient_steps,
             batch_states=FLAGS.preference_batch_states,
+            learning_rate=FLAGS.preference_learning_rate,
+            normalized_input_clip=FLAGS.preference_normalized_input_clip,
+            select_best_holdout_checkpoint=FLAGS.preference_select_best_holdout_checkpoint,
             holdout_modulus=FLAGS.preference_holdout_modulus,
             holdout_remainder=FLAGS.preference_holdout_remainder,
             recent_holdout_min_states=FLAGS.preference_recent_holdout_min_states,

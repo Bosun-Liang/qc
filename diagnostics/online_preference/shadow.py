@@ -112,6 +112,9 @@ class OnlinePreferenceShadow:
         update_every_states=20,
         gradient_steps=200,
         batch_states=32,
+        learning_rate=3e-4,
+        normalized_input_clip=0.0,
+        select_best_holdout_checkpoint=False,
         holdout_modulus=5,
         holdout_remainder=0,
         recent_holdout_min_states=20,
@@ -133,6 +136,9 @@ class OnlinePreferenceShadow:
             self.output_dir,
             seed=seed,
             pair_epsilon=pair_epsilon,
+            learning_rate=learning_rate,
+            normalized_input_clip=normalized_input_clip,
+            select_best_holdout_checkpoint=select_best_holdout_checkpoint,
         )
         self.seed = seed
         self.collection_interval_chunks = int(collection_interval_chunks)
@@ -186,6 +192,9 @@ class OnlinePreferenceShadow:
                 "update_every_states": update_every_states,
                 "gradient_steps": gradient_steps,
                 "batch_states": batch_states,
+                "learning_rate": learning_rate,
+                "normalized_input_clip": normalized_input_clip,
+                "select_best_holdout_checkpoint": select_best_holdout_checkpoint,
                 "holdout_modulus": holdout_modulus,
                 "holdout_remainder": holdout_remainder,
                 "recent_holdout_min_states": recent_holdout_min_states,
@@ -384,6 +393,11 @@ class OnlinePreferenceShadow:
             "is_ood": ood["is_ood"],
             "observation_normalized_abs": ood["observation_normalized_abs_max"],
             "action_normalized_abs_max": ood["action_normalized_abs_max"],
+            "pre_clip_normalized_abs_max": ood["pre_clip_normalized_abs_max"],
+            "post_clip_normalized_abs_max": ood["post_clip_normalized_abs_max"],
+            "normalized_feature_clipped_fraction": ood[
+                "normalized_feature_clipped_fraction"
+            ],
             "collection_timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "current_agent_update_step": int(qc_update_count),
             "current_checkpoint_identifier": self.metadata["qc_restore_checkpoint"],
@@ -491,6 +505,41 @@ class OnlinePreferenceShadow:
             }
         update["online_train_states"] = len(train_records)
         update["online_holdout_states"] = len(holdout)
+        update["normalization_clipping"] = {
+            "pre_clip_max_abs": float(
+                np.max(
+                    [
+                        record["pre_clip_normalized_abs_max"]
+                        for record in train_records
+                    ]
+                )
+            ),
+            "post_clip_max_abs": float(
+                np.max(
+                    [
+                        record["post_clip_normalized_abs_max"]
+                        for record in train_records
+                    ]
+                )
+            ),
+            "mean_clipped_feature_fraction": float(
+                np.mean(
+                    [
+                        record["normalized_feature_clipped_fraction"]
+                        for record in train_records
+                    ]
+                )
+            ),
+            "ood_states": int(sum(record["is_ood"] for record in train_records)),
+        }
+        update.update(
+            self.trainer.consider_best_holdout_checkpoint(
+                update["checkpoint"],
+                update["recent_holdout"],
+                self.recent_holdout_min_states,
+                main_env_step,
+            )
+        )
         self.update_history.append(update)
         with open(self.training_log, "a") as file:
             file.write(json.dumps(_json_ready(update), sort_keys=True) + "\n")
@@ -552,7 +601,26 @@ class OnlinePreferenceShadow:
                 "mean_fraction_abs_gt_5": float(np.mean([record["fraction_abs_gt_5"] for record in records])) if records else None,
                 "max_normalized_abs": float(np.max([record["normalized_abs_max"] for record in records])) if records else None,
                 "ood_states": int(sum(record["is_ood"] for record in records)),
+                "pre_clip_max_normalized_abs": float(
+                    np.max(
+                        [record["pre_clip_normalized_abs_max"] for record in records]
+                    )
+                ) if records else None,
+                "post_clip_max_normalized_abs": float(
+                    np.max(
+                        [record["post_clip_normalized_abs_max"] for record in records]
+                    )
+                ) if records else None,
+                "mean_clipped_feature_fraction": float(
+                    np.mean(
+                        [
+                            record["normalized_feature_clipped_fraction"]
+                            for record in records
+                        ]
+                    )
+                ) if records else None,
             },
+            "best_online_checkpoint": self.trainer.best_holdout_metadata,
         }
         with open(self.output_dir / "final_summary.json", "w") as file:
             json.dump(_json_ready(final), file, indent=2, sort_keys=True)

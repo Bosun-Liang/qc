@@ -13,6 +13,7 @@ from diagnostics.candidate_branch_rollout_smoke import (
 )
 from diagnostics.online_preference.buffer import OnlinePreferenceBuffer
 from diagnostics.online_preference.trainer import OnlineSelectorTrainer
+from diagnostics.pairwise_selector import restore_state
 
 
 DATASET = "/root/autodl-tmp/qc_workspace/datasets/qc_branch_preferences_h80_seed0.npz"
@@ -148,14 +149,119 @@ def main():
         assert np.isfinite(update["train_loss"])
         assert np.isfinite(update["gradient_norm"])
         assert Path(update["checkpoint"]).exists()
+        assert trainer.latest_checkpoint_path.exists()
+        latest_restored = restore_state(trainer.latest_checkpoint_path, trainer.state)
+        latest_observations, latest_actions = trainer.normalized_online(
+            restored_buffer.train_records
+        )
+        np.testing.assert_array_equal(
+            trainer.predict_records(restored_buffer.train_records),
+            np.asarray(latest_restored(latest_observations, latest_actions)),
+        )
         assert update["online_batch_fraction"] == 1 / 8
+
+        stable_trainer = OnlineSelectorTrainer(
+            SELECTOR,
+            NORMALIZATION,
+            DATASET,
+            root / "stable_trainer",
+            seed=1,
+            learning_rate=1e-4,
+            normalized_input_clip=5.0,
+            select_best_holdout_checkpoint=True,
+        )
+        extreme = synthetic_record(1)
+        extreme["observation"] = (
+            stable_trainer.normalization["observation_mean"]
+            + 100.0 * stable_trainer.normalization["observation_std"]
+        ).astype(np.float32)
+        extreme_actions = (
+            stable_trainer.normalization["action_mean"]
+            - 100.0 * stable_trainer.normalization["action_std"]
+        ).astype(np.float32)
+        extreme["candidate_action_chunks"] = np.repeat(
+            extreme_actions[None, :], 4, axis=0
+        ).reshape(4, 5, 5)
+        params_before = jax.tree_util.tree_map(
+            lambda value: np.array(value, copy=True), stable_trainer.state.params
+        )
+        clipped_observations, clipped_actions = stable_trainer.normalized_online(
+            [extreme]
+        )
+        assert np.max(clipped_observations) == 5.0
+        assert np.min(clipped_actions) == -5.0
+        predictions = stable_trainer.predict_records([extreme])
+        assert np.isfinite(predictions).all()
+        ood = stable_trainer.ood_statistics(
+            extreme["observation"], extreme["candidate_action_chunks"]
+        )
+        assert ood["pre_clip_normalized_abs_max"] >= 99.0
+        assert ood["post_clip_normalized_abs_max"] == 5.0
+        assert ood["normalized_feature_clipped_fraction"] == 1.0
+        for before_leaf, after_leaf in zip(
+            jax.tree_util.tree_leaves(params_before),
+            jax.tree_util.tree_leaves(stable_trainer.state.params),
+        ):
+            np.testing.assert_array_equal(before_leaf, np.asarray(after_leaf))
+
+        stable_update = stable_trainer.update(
+            restored_buffer.train_records,
+            gradient_steps=1,
+            batch_states=8,
+            main_env_step=1,
+        )
+        insufficient = {
+            "status": "ok",
+            "selector": {
+                "states": 19,
+                "top1_regret": 10.0,
+                "pairwise_accuracy": 0.5,
+                "spearman": 0.0,
+            },
+        }
+        result = stable_trainer.consider_best_holdout_checkpoint(
+            stable_update["checkpoint"], insufficient, 20, 1
+        )
+        assert result["best_checkpoint_status"] == "insufficient_holdout"
+        assert not stable_trainer.best_checkpoint_path.exists()
+
+        def holdout(regret, pairwise, spearman=0.0):
+            return {
+                "status": "ok",
+                "selector": {
+                    "states": 20,
+                    "top1_regret": regret,
+                    "pairwise_accuracy": pairwise,
+                    "spearman": spearman,
+                },
+            }
+
+        assert stable_trainer.consider_best_holdout_checkpoint(
+            stable_update["checkpoint"], holdout(10.0, 0.5), 20, 2
+        )["best_checkpoint_updated"]
+        assert stable_trainer.consider_best_holdout_checkpoint(
+            stable_update["checkpoint"], holdout(9.0, 0.5), 20, 3
+        )["best_checkpoint_updated"]
+        assert stable_trainer.consider_best_holdout_checkpoint(
+            stable_update["checkpoint"], holdout(9.0, 0.6), 20, 4
+        )["best_checkpoint_updated"]
+        restored_best = restore_state(
+            stable_trainer.best_checkpoint_path, stable_trainer.state
+        )
+        expected = stable_trainer.predict_records(restored_buffer.train_records)
+        obs, acts = stable_trainer.normalized_online(restored_buffer.train_records)
+        actual = np.asarray(restored_best(obs, acts))
+        np.testing.assert_array_equal(expected, actual)
     print("preference_disabled_best_of_n_exact=passed")
     print("offline_selector_checkpoint_restore=passed")
     print("normalization_restore=passed")
     print("online_buffer_insert_sample_save_restore=passed")
+    print("normalized_input_clipping=passed")
+    print("best_holdout_checkpoint_selection=passed")
     print("episode_grouped_holdout_leakage_check=passed")
     print("state_group_pair_construction=passed")
     print("one_selector_update=passed")
+    print("latest_checkpoint_selection=passed")
     print("finite_loss_gradient=passed")
     print("resume_smoke=passed")
     print("online_preference_shadow_unit_smoke=passed")
