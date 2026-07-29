@@ -163,6 +163,28 @@ flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
+flags.DEFINE_bool(
+    'enable_online_preference_shadow',
+    False,
+    'Collect/train an online preference selector without changing actions.',
+)
+flags.DEFINE_string('preference_offline_checkpoint', None, 'Offline selector checkpoint.')
+flags.DEFINE_string('preference_offline_normalization', None, 'Offline selector normalization NPZ.')
+flags.DEFINE_string('preference_offline_dataset', None, 'Frozen offline preference dataset.')
+flags.DEFINE_integer('preference_collection_interval_chunks', 20, 'Chunk boundaries between branch labels.')
+flags.DEFINE_integer('preference_top_k', 4, 'Critic top-k candidates to branch.')
+flags.DEFINE_integer('preference_continuation_horizon', 80, 'Branch continuation steps.')
+flags.DEFINE_float('preference_pair_epsilon', 1.0, 'Minimum online pair return margin.')
+flags.DEFINE_integer('preference_min_online_states', 50, 'Minimum online train states before updates.')
+flags.DEFINE_integer('preference_update_every_states', 20, 'New train states between update phases.')
+flags.DEFINE_integer('preference_gradient_steps', 200, 'Gradient steps per selector update phase.')
+flags.DEFINE_integer('preference_batch_states', 32, 'State groups per selector batch.')
+flags.DEFINE_string('preference_output_dir', None, 'Independent preference shadow output directory.')
+flags.DEFINE_integer('preference_holdout_modulus', 5, 'episode_id modulus used for holdout.')
+flags.DEFINE_integer('preference_holdout_remainder', 0, 'episode_id remainder assigned to holdout.')
+flags.DEFINE_integer('preference_recent_holdout_min_states', 20, 'Minimum recent holdout states for metrics.')
+flags.DEFINE_bool('preference_resume', False, 'Resume preference buffer and latest selector checkpoint.')
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -1710,12 +1732,57 @@ def main(_):
     )
         
     ob, _ = env.reset()
+
+    preference_shadow = None
+    if FLAGS.enable_online_preference_shadow:
+        required_preference_paths = {
+            "--preference_offline_checkpoint": FLAGS.preference_offline_checkpoint,
+            "--preference_offline_normalization": FLAGS.preference_offline_normalization,
+            "--preference_offline_dataset": FLAGS.preference_offline_dataset,
+            "--preference_output_dir": FLAGS.preference_output_dir,
+        }
+        missing = [name for name, value in required_preference_paths.items() if not value]
+        if missing:
+            raise ValueError(
+                "Online preference shadow requires " + ", ".join(missing)
+            )
+        if config["actor_type"] != "best-of-n" or config["actor_num_samples"] != 32:
+            raise ValueError("Online preference shadow requires best-of-n with 32 candidates")
+        from diagnostics.online_preference.shadow import OnlinePreferenceShadow
+
+        preference_shadow = OnlinePreferenceShadow(
+            env=env,
+            output_dir=FLAGS.preference_output_dir,
+            selector_checkpoint=FLAGS.preference_offline_checkpoint,
+            selector_normalization=FLAGS.preference_offline_normalization,
+            offline_dataset=FLAGS.preference_offline_dataset,
+            qc_checkpoint=FLAGS.restore_file,
+            environment_name=FLAGS.env_name,
+            seed=FLAGS.seed,
+            collection_interval_chunks=FLAGS.preference_collection_interval_chunks,
+            top_k=FLAGS.preference_top_k,
+            continuation_horizon=FLAGS.preference_continuation_horizon,
+            discount=FLAGS.discount,
+            pair_epsilon=FLAGS.preference_pair_epsilon,
+            min_online_states=FLAGS.preference_min_online_states,
+            update_every_states=FLAGS.preference_update_every_states,
+            gradient_steps=FLAGS.preference_gradient_steps,
+            batch_states=FLAGS.preference_batch_states,
+            holdout_modulus=FLAGS.preference_holdout_modulus,
+            holdout_remainder=FLAGS.preference_holdout_remainder,
+            recent_holdout_min_states=FLAGS.preference_recent_holdout_min_states,
+            resume=FLAGS.preference_resume,
+        )
     
     action_queue = []
     action_dim = example_batch["actions"].shape[-1]
 
     # Online RL
     update_info = {}
+    online_episode_id = 0
+    online_episode_step = 0
+    current_critic_selected_index = -1
+    current_executed_candidate_index = -1
 
     from collections import defaultdict
     data = defaultdict(list)
@@ -1726,7 +1793,32 @@ def main(_):
         
         # during online rl, the action chunk is executed fully
         if len(action_queue) == 0:
-            action = agent.sample_actions(observations=ob, rng=key)
+            if preference_shadow is None:
+                action = agent.sample_actions(observations=ob, rng=key)
+            else:
+                candidates, critic_scores, critic_selected_index = (
+                    agent.sample_best_of_n_candidates(
+                        jax.numpy.asarray(ob), key
+                    )
+                )
+                current_critic_selected_index = int(
+                    np.asarray(critic_selected_index)
+                )
+                current_executed_candidate_index = current_critic_selected_index
+                action = np.asarray(candidates)[current_critic_selected_index]
+                preference_shadow.on_chunk_boundary(
+                    agent=agent,
+                    observation=ob,
+                    candidates=candidates,
+                    critic_scores=critic_scores,
+                    critic_selected_index=critic_selected_index,
+                    main_policy_rng=online_rng,
+                    main_env_step=i,
+                    episode_id=online_episode_id,
+                    state_step=online_episode_step,
+                    qc_replay=replay_buffer,
+                    qc_update_count=preference_shadow.qc_update_count,
+                )
 
             action_chunk = np.array(action).reshape(-1, action_dim)
             for action in action_chunk:
@@ -1735,6 +1827,17 @@ def main(_):
         
         next_ob, int_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
+        if preference_shadow is not None:
+            preference_shadow.after_main_step(
+                observation=next_ob,
+                reward=int_reward,
+                terminated=terminated,
+                truncated=truncated,
+                main_policy_rng=online_rng,
+                executed_candidate_index=current_executed_candidate_index,
+                critic_selected_candidate_index=current_critic_selected_index,
+            )
+        online_episode_step += 1
 
         if FLAGS.save_all_online_states:
             state = env.get_state()
@@ -1778,6 +1881,12 @@ def main(_):
         
         # done
         if done:
+            if preference_shadow is not None:
+                preference_shadow.end_episode(
+                    online_episode_id, info.get("success", False)
+                )
+            online_episode_id += 1
+            online_episode_step = 0
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
         else:
@@ -1790,6 +1899,12 @@ def main(_):
                 FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
 
             agent, agent_info = agent.batch_update(batch)
+            if preference_shadow is not None:
+                preference_shadow.record_qc_update(
+                    main_env_step=i,
+                    replay_size=replay_buffer.size,
+                    agent_info=agent_info,
+                )
             if world_model is not None:
                 world_model, world_model_info = world_model.batch_update(batch)
                 agent_info = {
@@ -1898,6 +2013,14 @@ def main(_):
 
     end_time = time.time()
 
+    if preference_shadow is not None:
+        preference_summary = preference_shadow.finalize(FLAGS.online_steps)
+        print(
+            "ONLINE_PREFERENCE_SHADOW_SUMMARY="
+            + json.dumps(preference_summary, default=str, sort_keys=True),
+            flush=True,
+        )
+
     for key, csv_logger in logger.csv_loggers.items():
         csv_logger.close()
 
@@ -1914,7 +2037,7 @@ def main(_):
         np.savez(os.path.join(FLAGS.save_dir, "data.npz"), **c_data)
 
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
-        f.write(run.url)
+        f.write(run.url or '')
 
 if __name__ == '__main__':
     app.run(main)

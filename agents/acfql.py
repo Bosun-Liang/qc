@@ -159,6 +159,41 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
     
     @jax.jit
+    def sample_best_of_n_candidates(self, observations, rng):
+        """Expose the exact candidates, critic scores, and selected indices."""
+        if self.config["actor_type"] != "best-of-n":
+            raise ValueError("Candidate exposure requires actor_type=best-of-n")
+        action_dim = self.config['action_dim'] * (
+            self.config['horizon_length']
+            if self.config["action_chunking"]
+            else 1
+        )
+        noises = jax.random.normal(
+            rng,
+            (
+                *observations.shape[: -len(self.config['ob_dims'])],
+                self.config["actor_num_samples"],
+                action_dim,
+            ),
+        )
+        candidate_observations = jnp.repeat(
+            observations[..., None, :],
+            self.config["actor_num_samples"],
+            axis=-2,
+        )
+        actions = self.compute_flow_actions(candidate_observations, noises)
+        actions = jnp.clip(actions, -1, 1)
+        candidate_qs = self.network.select("critic")(
+            candidate_observations, actions
+        )
+        if self.config["q_agg"] == "mean":
+            scores = candidate_qs.mean(axis=0)
+        else:
+            scores = candidate_qs.min(axis=0)
+        indices = jnp.argmax(scores, axis=-1)
+        return actions, scores, indices
+
+    @jax.jit
     def sample_actions(
         self,
         observations,
@@ -180,21 +215,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         elif self.config["actor_type"] == "best-of-n":
             action_dim = self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
-            noises = jax.random.normal(
-                rng,
-                (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config["actor_num_samples"], action_dim
-                ),
+            actions, _, indices = self.sample_best_of_n_candidates(
+                observations, rng
             )
-            observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
-            actions = self.compute_flow_actions(observations, noises)
-            actions = jnp.clip(actions, -1, 1)
-            if self.config["q_agg"] == "mean":
-                q = self.network.select("critic")(observations, actions).mean(axis=0)
-            else:
-                q = self.network.select("critic")(observations, actions).min(axis=0)
-            indices = jnp.argmax(q, axis=-1)
 
             bshape = indices.shape
             indices = indices.reshape(-1)

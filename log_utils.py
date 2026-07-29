@@ -71,6 +71,9 @@ def setup_wandb(
     mode='online',
 ):
     """Set up Weights & Biases for logging."""
+    # Respect an explicit process-level mode for isolated/local smoke tests.
+    # With no environment override, the historical online default is unchanged.
+    mode = os.environ.get('WANDB_MODE', mode)
     wandb_output_dir = tempfile.mkdtemp()
     tags = [group] if group is not None else None
 
